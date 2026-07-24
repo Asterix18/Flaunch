@@ -1,0 +1,15 @@
+# Swift Package Manager build output
+.build/
+*.xcodeproj
+DerivedData/
+
+# Built app bundle and distributable (regenerate with ./build-app.sh [--dist])
+*.app/
+*.zip
+
+# macOS cruft
+.DS_Store
+._*
+
+# Local Claude Code settings (personal, per-machine)
+.claude/settings.local.json
