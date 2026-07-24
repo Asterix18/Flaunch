@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "ClaudeFolderLauncher",
+    name: "Flaunch",
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
-            name: "ClaudeFolderLauncher",
-            path: "Sources/ClaudeFolderLauncher"
+            name: "Flaunch",
+            path: "Sources/Flaunch"
         )
     ]
 )

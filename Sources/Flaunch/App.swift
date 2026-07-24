@@ -1326,7 +1326,7 @@ struct ContentView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "folder.fill")
                         .foregroundStyle(.secondary)
-                    Text(model.currentURL?.lastPathComponent ?? "Claude Folder Launcher")
+                    Text(model.currentURL?.lastPathComponent ?? "Flaunch")
                         .font(.headline)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1580,7 +1580,7 @@ struct ContentView: View {
                     set: { launchAtLogin.setEnabled($0) }
                 ))
                 Divider()
-                Button("Quit Claude Folder Launcher") {
+                Button("Quit Flaunch") {
                     NSApp.terminate(nil)
                 }
                 .keyboardShortcut("q", modifiers: .command)
@@ -3395,7 +3395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .applying(.init(scale: .medium))
             let image = NSImage(
                 systemSymbolName: "terminal",
-                accessibilityDescription: "Claude Folder Launcher"
+                accessibilityDescription: "Flaunch"
             )?.withSymbolConfiguration(config)
             image?.isTemplate = true
             button.image = image
@@ -3470,7 +3470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settingsWindow == nil {
             let host = NSHostingController(rootView: PreferencesView().environmentObject(prefs))
             let window = NSWindow(contentViewController: host)
-            window.title = "Claude Folder Launcher Settings"
+            window.title = "Flaunch Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.center()
@@ -3587,7 +3587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - App entry
 
 @main
-struct ClaudeFolderLauncherApp: App {
+struct FlaunchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {

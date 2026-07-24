@@ -1,10 +1,10 @@
 #!/bin/bash
-# Double-click this to install Claude Folder Launcher.
+# Double-click this to install Flaunch.
 # It copies the app into /Applications, clears the macOS "unidentified
 # developer" quarantine flag so it opens on a normal double-click, and launches it.
 set -euo pipefail
 
-APP_NAME="Claude Folder Launcher"
+APP_NAME="Flaunch"
 APP_BUNDLE="${APP_NAME}.app"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="${HERE}/${APP_BUNDLE}"

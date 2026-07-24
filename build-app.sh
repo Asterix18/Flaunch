@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build ClaudeFolderLauncher.app — a clickable macOS app bundle.
+# Build Flaunch.app — a clickable macOS app bundle.
 # Pass --install to also copy the bundle to /Applications.
 set -euo pipefail
 
@@ -20,9 +20,9 @@ for arg in "$@"; do
     esac
 done
 
-APP_NAME="Claude Folder Launcher"
-BIN_NAME="ClaudeFolderLauncher"
-BUNDLE_ID="com.georgegoodwin.claudefolderlauncher"
+APP_NAME="Flaunch"
+BIN_NAME="Flaunch"
+BUNDLE_ID="com.georgegoodwin.flaunch"
 APP_DIR="${APP_NAME}.app"
 
 echo "→ Building release binary…"

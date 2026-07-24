@@ -1,4 +1,4 @@
-# Claude Folder Launcher
+# Flaunch
 
 A menu bar app for opening a Terminal running `claude` in any of your project folders.
 
@@ -9,7 +9,7 @@ A menu bar app for opening a Terminal running `claude` in any of your project fo
 
 ## First-time setup
 
-1. Unzip the download. You'll get a **Claude Folder Launcher** folder containing the app and an
+1. Unzip the download. You'll get a **Flaunch** folder containing the app and an
    **`install.command`** installer.
 2. **Right-click (Control-click) `install.command` → Open → Open.** That's the whole install: it
    copies the app to `/Applications`, clears the macOS quarantine flag, and launches it.
@@ -114,7 +114,7 @@ While the launcher is open:
 ## Rebuilding from source
 
 ```bash
-./build-app.sh            # builds Claude Folder Launcher.app in this folder
+./build-app.sh            # builds Flaunch.app in this folder
 ./build-app.sh --install  # also copies it to /Applications, replacing the running instance
-./build-app.sh --dist     # also packages app + install.command into Claude Folder Launcher.zip
+./build-app.sh --dist     # also packages app + install.command into Flaunch.zip
 ```
