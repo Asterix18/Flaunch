@@ -31,6 +31,8 @@ final class FolderModel: ObservableObject {
     @Published var rootURL: URL?
     @Published var currentURL: URL?
     @Published var subfolders: [URL] = []
+    /// Non-directory files in the current folder (used by the Scripts view).
+    @Published var files: [URL] = []
     /// When non-nil, the UI shows the first-run setup flow for this root (choose which
     /// folders to show). Set whenever the user actively picks/switches a root.
     @Published var pendingSetupRoot: URL?
@@ -159,7 +161,11 @@ final class FolderModel: ObservableObject {
         cloneRepo(urlString, into: target)
     }
 
-    private func cloneRepo(_ urlString: String, into folder: URL) {
+    /// Clones `urlString` into `folder`. `openWhenDone` opens the fresh repo in Claude (as when
+    /// cloning from the header); the New-Project flow turns it off and uses `completion` to chain
+    /// the next "add a repo" prompt.
+    private func cloneRepo(_ urlString: String, into folder: URL,
+                           openWhenDone: Bool = true, completion: (() -> Void)? = nil) {
         isCloning = true
         errorMessage = nil
         let before = folderNames(in: folder)
@@ -171,15 +177,169 @@ final class FolderModel: ObservableObject {
             self.isCloning = false
             guard failure == nil else {
                 self.errorMessage = failure
+                completion?()
                 return
             }
             self.loadSubfolders()
             // Open the newly cloned repo directly in Claude, same as clicking any folder row.
-            if let cloned = self.subfolders.first(where: { !before.contains($0.lastPathComponent) }) {
+            if openWhenDone,
+               let cloned = self.subfolders.first(where: { !before.contains($0.lastPathComponent) }) {
                 self.openInTerminal(cloned)
             }
+            completion?()
         }
     }
+
+    // MARK: New project
+
+    /// Prompts for a name and scaffolds a standardized project in the current folder, then walks
+    /// the user through adding git repositories to it.
+    func promptNewProject() {
+        guard let parent = currentURL else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "New Project"
+        alert.informativeText = "Create a project in \"\(parent.lastPathComponent)\" with your standard folder structure."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.placeholderString = "Project name"
+        alert.accessoryView = input
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        createProject(named: name, in: parent)
+    }
+
+    /// Creates `<parent>/<name>/` with the configured template folders and a seeded CLAUDE.md /
+    /// README.md, shows it, then offers to add repositories.
+    func createProject(named name: String, in parent: URL) {
+        guard let project = scaffoldProject(named: name, in: parent) else { return }
+        navigateInto(project)                    // show the new project's contents
+        promptAddRepositories(to: project)
+    }
+
+    /// Pure filesystem scaffold (no UI): makes the project + template folders and seeds
+    /// CLAUDE.md / README.md. Returns the project URL, or nil on failure (sets `errorMessage`).
+    @discardableResult
+    func scaffoldProject(named name: String, in parent: URL) -> URL? {
+        let fm = FileManager.default
+        let project = parent.appendingPathComponent(name)
+        guard !fm.fileExists(atPath: project.path) else {
+            errorMessage = "“\(name)” already exists here."
+            return nil
+        }
+        let folders = prefs.projectFolders
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        do {
+            try fm.createDirectory(at: project, withIntermediateDirectories: true)
+            for folder in folders {
+                try fm.createDirectory(at: project.appendingPathComponent(folder),
+                                       withIntermediateDirectories: true)
+            }
+            try FolderModel.seededClaudeMd(name: name, folders: folders)
+                .write(to: project.appendingPathComponent("CLAUDE.md"), atomically: true, encoding: .utf8)
+            try FolderModel.seededReadme(name: name, folders: folders)
+                .write(to: project.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Couldn't create project: \(error.localizedDescription)"
+            return nil
+        }
+        return project
+    }
+
+    /// Loop-prompts the user to clone git repos into `<project>/Repositories`, then reopens the
+    /// launcher on the finished project.
+    func promptAddRepositories(to project: URL) {
+        let repos = project.appendingPathComponent("Repositories")
+        // If the template has no Repositories folder, drop the repo step entirely.
+        guard FileManager.default.fileExists(atPath: repos.path) else {
+            NotificationCenter.default.post(name: .cflShowLauncher, object: nil)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Add a Repository"
+        alert.informativeText = "Clone a git repo into \(project.lastPathComponent)/Repositories. Leave blank when you're done."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Clone")
+        alert.addButton(withTitle: "Done")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.placeholderString = "git@github.com:org/repo.git"
+        alert.accessoryView = input
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = input
+        let response = alert.runModal()
+        let urlString = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard response == .alertFirstButtonReturn, !urlString.isEmpty else {
+            loadSubfolders()
+            NotificationCenter.default.post(name: .cflShowLauncher, object: nil)
+            return
+        }
+        cloneRepo(urlString, into: repos, openWhenDone: false) { [weak self] in
+            DispatchQueue.main.async { self?.promptAddRepositories(to: project) }
+        }
+    }
+
+    /// Starter CLAUDE.md for a new project, listing the template folders so it stays in sync.
+    private static func seededClaudeMd(name: String, folders: [String]) -> String {
+        let descriptions = folderDescriptions
+        let list = folders.map { "- `\($0)/` — \(descriptions[$0] ?? "")".trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "\n")
+        return """
+        # \(name)
+
+        Project instructions for Claude Code. Because this file sits at the project root, it's
+        picked up automatically for every repository under `Repositories/`.
+
+        ## Overview
+
+        <what this project is, who it's for, current status>
+
+        ## Structure
+
+        \(list)
+
+        ## Conventions
+
+        <coding standards, environments, credentials, gotchas>
+        """
+    }
+
+    /// Starter README.md for a new project.
+    private static func seededReadme(name: String, folders: [String]) -> String {
+        let descriptions = folderDescriptions
+        let rows = folders.map { "| `\($0)/` | \(descriptions[$0] ?? "") |" }.joined(separator: "\n")
+        return """
+        # \(name)
+
+        ## Structure
+
+        | Folder | Contents |
+        | --- | --- |
+        \(rows)
+
+        _Scaffolded by Flaunch._
+        """
+    }
+
+    private static let folderDescriptions: [String: String] = [
+        "Repositories": "Cloned git repos (the code)",
+        "Data": "Datasets, exports, sample data",
+        "Scripts": "Automation & one-off utilities",
+        "Docs": "Specs, notes, decisions",
+        "Reference": "External specs / client-supplied material",
+    ]
 
     private func folderNames(in folder: URL) -> Set<String> {
         let contents = (try? FileManager.default.contentsOfDirectory(
@@ -230,12 +390,19 @@ final class FolderModel: ObservableObject {
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
+            let byName: (URL, URL) -> Bool = {
+                $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+            }
             subfolders = contents
                 .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-                .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+                .sorted(by: byName)
+            files = contents
+                .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true }
+                .sorted(by: byName)
             errorMessage = nil
         } catch {
             subfolders = []
+            files = []
             errorMessage = "Could not read folder: \(error.localizedDescription)"
         }
         // Only the root drives the deep filter, so (re)build the index whenever the root loads.
@@ -292,6 +459,58 @@ final class FolderModel: ObservableObject {
 
     func openInFinder(_ folder: URL) {
         NSWorkspace.shared.open(folder)
+    }
+
+    /// Opens a file (e.g. CLAUDE.md / README.md) in its default app.
+    func openFile(_ file: URL) {
+        NSWorkspace.shared.open(file)
+    }
+
+    /// Reveals a file in Finder (selected).
+    func revealInFinder(_ file: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([file])
+    }
+
+    /// Known script extensions we can run without an executable bit.
+    static let scriptExtensions: Set<String> = [
+        "sh", "bash", "zsh", "command", "py", "rb", "pl", "js", "mjs", "cjs", "ts",
+    ]
+
+    /// Whether `file` looks runnable: it's executable, or has a known script extension.
+    func isScript(_ file: URL) -> Bool {
+        if FileManager.default.isExecutableFile(atPath: file.path) { return true }
+        return FolderModel.scriptExtensions.contains(file.pathExtension.lowercased())
+    }
+
+    /// Runs `file` in a terminal opened at its folder, so output is visible.
+    func runScript(_ file: URL) {
+        let folder = file.deletingLastPathComponent()
+        history.record(folder)
+        let command = scriptRunCommand(for: file)
+        if let error = TerminalLauncher.launch(
+            folder: folder, command: command, terminalBundleId: prefs.terminalBundleId
+        ) {
+            errorMessage = error
+        }
+    }
+
+    /// Builds the shell command to run `file` (already cd'd into its folder): `./name` when
+    /// executable, otherwise the matching interpreter by extension.
+    private func scriptRunCommand(for file: URL) -> String {
+        let name = file.lastPathComponent
+        let quoted = "'" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        if FileManager.default.isExecutableFile(atPath: file.path) {
+            return "./\(quoted)"
+        }
+        switch file.pathExtension.lowercased() {
+        case "py":                 return "python3 \(quoted)"
+        case "js", "mjs", "cjs":   return "node \(quoted)"
+        case "ts":                 return "node \(quoted)"
+        case "rb":                 return "ruby \(quoted)"
+        case "pl":                 return "perl \(quoted)"
+        case "zsh":                return "zsh \(quoted)"
+        default:                   return "bash \(quoted)"   // sh, bash, command, or unknown
+        }
     }
 
     func copyPath(_ folder: URL) {
@@ -621,6 +840,8 @@ final class Preferences: ObservableObject {
     /// path. Absent = show everything (default). Chosen in the first-run setup flow;
     /// hidden folders stay reachable via search.
     @Published var shownFoldersByRoot: [String: [String]] { didSet { d.set(shownFoldersByRoot, forKey: Keys.shown) } }
+    /// Folder names created inside each new project scaffold (plus a seeded CLAUDE.md and README.md).
+    @Published var projectFolders: [String] { didSet { d.set(projectFolders, forKey: Keys.projectFolders) } }
     /// Global hotkey virtual key code + Carbon modifier mask, plus a display string.
     @Published private(set) var hotKeyCode: UInt32
     @Published private(set) var hotKeyModifiers: UInt32
@@ -636,6 +857,7 @@ final class Preferences: ObservableObject {
         static let command = "CFL.launchCommand"
         static let featured = "CFL.featuredFolders"
         static let shown = "CFL.shownFoldersByRoot"
+        static let projectFolders = "CFL.projectFolders"
         static let hkCode = "CFL.hotKeyCode"
         static let hkMods = "CFL.hotKeyModifiers"
         static let hkDisplay = "CFL.hotKeyDisplay"
@@ -647,6 +869,8 @@ final class Preferences: ObservableObject {
         launchCommand = store.string(forKey: Keys.command) ?? "claude"
         featuredFolderNames = store.stringArray(forKey: Keys.featured) ?? ["PROJECTS", "OTHER STUFF"]
         shownFoldersByRoot = (store.dictionary(forKey: Keys.shown) as? [String: [String]]) ?? [:]
+        projectFolders = store.stringArray(forKey: Keys.projectFolders)
+            ?? ["Repositories", "Data", "Scripts", "Docs", "Reference"]
         hotKeyCode = store.object(forKey: Keys.hkCode) != nil
             ? UInt32(store.integer(forKey: Keys.hkCode)) : Preferences.defaultHotKeyCode
         hotKeyModifiers = store.object(forKey: Keys.hkMods) != nil
@@ -1126,6 +1350,181 @@ struct ContentView: View {
     private var plainFolders: [URL] { listedSubfolders.filter { $0.gitBranch == nil } }
     private var showsSectionHeaders: Bool { !gitFolders.isEmpty && !plainFolders.isEmpty }
 
+    // MARK: Project view (a folder holding the standard template structure)
+
+    /// True when the current folder holds the project template: it has a `Repositories`
+    /// subfolder, or matches at least two of the configured template folders.
+    private var currentFolderIsProject: Bool {
+        let names = Set(model.subfolders.map { $0.lastPathComponent })
+        if names.contains("Repositories") { return true }
+        return prefs.projectFolders.filter { names.contains($0) }.count >= 2
+    }
+
+    /// Show the tailored project view once browsed into a project (and not filtering).
+    private var isProjectView: Bool {
+        model.canGoBack && filterText.isEmpty && currentFolderIsProject
+    }
+
+    /// The Scripts folder gets a runnable-file view (files, not just subfolders).
+    private var isScriptsFolder: Bool {
+        model.canGoBack && model.currentURL?.lastPathComponent == "Scripts"
+    }
+
+    private func matchesFilter(_ url: URL) -> Bool {
+        filterText.isEmpty || url.lastPathComponent.localizedCaseInsensitiveContains(filterText)
+    }
+    private var scriptSubfolders: [URL] { model.subfolders.filter { matchesFilter($0) } }
+    private var scriptListFiles: [URL] { model.files.filter { matchesFilter($0) } }
+
+    /// Project subfolders in a stable order: the template folders that exist (in the
+    /// configured order) first, then any other subfolders alphabetically.
+    private var orderedProjectFolders: [URL] {
+        let order = prefs.projectFolders
+        func rank(_ name: String) -> Int { order.firstIndex(of: name) ?? order.count }
+        return model.subfolders.sorted {
+            let ra = rank($0.lastPathComponent), rb = rank($1.lastPathComponent)
+            if ra != rb { return ra < rb }
+            return $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+        }
+    }
+
+    private func projectFolderIcon(for name: String) -> String {
+        switch name {
+        case "Repositories": return "shippingbox.fill"
+        case "Data":         return "cylinder.fill"
+        case "Scripts":      return "terminal.fill"
+        case "Docs":         return "doc.text.fill"
+        case "Reference":    return "book.closed.fill"
+        default:             return featuredIcon(for: name)
+        }
+    }
+
+    /// Number of repositories (subdirectories) inside the project's Repositories folder.
+    private func repoCount(in project: URL) -> Int {
+        let repos = project.appendingPathComponent("Repositories")
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: repos, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles])) ?? []
+        return items.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }.count
+    }
+
+    private func repoCountLabel(_ project: URL) -> String {
+        let n = repoCount(in: project)
+        return n == 1 ? "1 repo" : "\(n) repos"
+    }
+
+    /// Tailored view for a project folder: a header + quick actions, then the template
+    /// folders as labeled rows (Repositories first, with its repo count).
+    @ViewBuilder
+    private var projectContent: some View {
+        if let project = model.currentURL {
+            VStack(spacing: 0) {
+                projectHeader(project)
+                Divider()
+                VStack(spacing: 0) {
+                    ForEach(Array(orderedProjectFolders.enumerated()), id: \.element) { i, folder in
+                        FeaturedRow(
+                            url: folder,
+                            icon: projectFolderIcon(for: folder.lastPathComponent),
+                            isSelected: isSelected(i),
+                            subtitleOverride: folder.lastPathComponent == "Repositories" ? repoCountLabel(project) : nil
+                        ) {
+                            model.navigateInto(folder)
+                            uiState.filterText = ""
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private func projectHeader(_ project: URL) -> some View {
+        let fm = FileManager.default
+        let claude = project.appendingPathComponent("CLAUDE.md")
+        let readme = project.appendingPathComponent("README.md")
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(project.lastPathComponent.uppercased())
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .kerning(0.5)
+                    .lineLimit(1)
+                Text("· \(repoCountLabel(project))")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+            }
+            HStack(spacing: 6) {
+                if fm.fileExists(atPath: claude.path) {
+                    projectPill("CLAUDE.md") { model.openFile(claude) }
+                }
+                if fm.fileExists(atPath: readme.path) {
+                    projectPill("README") { model.openFile(readme) }
+                }
+                projectPill("Terminal") { model.openInTerminal(project) }
+                projectPill("Add repo") { model.promptAddRepositories(to: project) }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    /// The Scripts folder view: subfolders (browse in) plus runnable script files. Clicking a
+    /// file opens a menu (Run / Open in Terminal / Edit / Reveal).
+    @ViewBuilder
+    private var scriptsContent: some View {
+        let subs = scriptSubfolders
+        let fs = scriptListFiles
+        if subs.isEmpty && fs.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: filterText.isEmpty ? "terminal" : "magnifyingglass")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.secondary)
+                Text(filterText.isEmpty ? "No scripts here yet" : "No matches")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 140)
+        } else {
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(Array(subs.enumerated()), id: \.element) { i, folder in
+                        FolderRow(url: folder, isSelected: isSelected(i))
+                    }
+                    ForEach(fs, id: \.self) { file in
+                        ScriptRow(
+                            file: file,
+                            isScript: model.isScript(file),
+                            onRun:      { model.runScript(file) },
+                            onTerminal: { model.openInTerminal(file.deletingLastPathComponent(), runClaude: false) },
+                            onEdit:     { model.openFile(file) },
+                            onReveal:   { model.revealInFinder(file) }
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+            }
+            .frame(height: min(max(CGFloat(subs.count + fs.count) * rowHeight + 8, rowHeight + 8), listMaxHeight))
+        }
+    }
+
+    private func projectPill(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .fixedSize()
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color.secondary.opacity(0.14))
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
     /// At the root, the filter searches the whole tree instead of just the top level.
     private var isRootSearch: Bool { !model.canGoBack && !filterText.isEmpty }
 
@@ -1158,6 +1557,14 @@ struct ContentView: View {
     private var navItems: [NavItem] {
         if isRootSearch {
             return searchResults.map { NavItem(url: $0.url, kind: .jump) }
+        }
+        if isProjectView {
+            // Labeled folder rows are containers — browse in (like featured rows).
+            return orderedProjectFolders.map { NavItem(url: $0, kind: .featured) }
+        }
+        if isScriptsFolder {
+            // Only subfolders are keyboard-navigable; script files use the click menu.
+            return scriptSubfolders.map { NavItem(url: $0, kind: .folder) }
         }
         var items: [NavItem] = []
         if showsHero {
@@ -1342,7 +1749,10 @@ struct ContentView: View {
 
             Spacer(minLength: 4)
 
-            Button(action: model.promptCloneRepo) {
+            Menu {
+                Button("New Project…", action: model.promptNewProject)
+                Button("Clone Repository…", action: model.promptCloneRepo)
+            } label: {
                 if model.isCloning {
                     ProgressView()
                         .controlSize(.small)
@@ -1350,9 +1760,11 @@ struct ContentView: View {
                     Image(systemName: "plus")
                 }
             }
-            .buttonStyle(.borderless)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .disabled(model.currentURL == nil || model.isCloning)
-            .help("Clone Repo…")
+            .help("New Project or Clone Repository…")
 
             Menu {
                 Button("Open in Terminal with Claude") {
@@ -1444,6 +1856,8 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(height: 160)
+        } else if isScriptsFolder {
+            scriptsContent
         } else if model.subfolders.isEmpty {
             VStack(spacing: 12) {
                 Image(systemName: "folder.badge.plus")
@@ -1462,6 +1876,8 @@ struct ContentView: View {
             .frame(height: 160)
         } else if isRootSearch {
             rootSearch
+        } else if isProjectView {
+            projectContent
         } else if filteredSubfolders.isEmpty {
             VStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -1786,6 +2202,9 @@ struct FeaturedRow: View {
     let url: URL
     let icon: String
     var isSelected: Bool = false
+    /// When set, used verbatim as the subtitle instead of the async folder count
+    /// (e.g. "6 repos" for a project's Repositories folder).
+    var subtitleOverride: String? = nil
     let action: () -> Void
     @State private var hovering = false
     @State private var subtitle = " "   // a space reserves the second line until the count loads
@@ -1831,6 +2250,10 @@ struct FeaturedRow: View {
         .padding(.horizontal, 6)
         .onHover { hovering = $0 }
         .task(id: url) {
+            if let subtitleOverride {
+                subtitle = subtitleOverride
+                return
+            }
             let target = url
             let count = await Task.detached(priority: .utility) {
                 let contents = (try? FileManager.default.contentsOfDirectory(
@@ -1844,6 +2267,67 @@ struct FeaturedRow: View {
             }.value
             subtitle = count == 1 ? "1 folder" : "\(count) folders"
         }
+    }
+}
+
+/// A file row in the Scripts view. Clicking opens a menu; for scripts that's Run / Open in
+/// Terminal / Edit / Reveal, for other files just Open / Reveal.
+struct ScriptRow: View {
+    let file: URL
+    let isScript: Bool
+    let onRun: () -> Void
+    let onTerminal: () -> Void
+    let onEdit: () -> Void
+    let onReveal: () -> Void
+    @State private var hovering = false
+
+    private var tileColors: [Color] { Palette.tile }
+
+    var body: some View {
+        Menu {
+            if isScript {
+                Button("Run", action: onRun)
+                Button("Open in Terminal", action: onTerminal)
+                Button("Edit", action: onEdit)
+            } else {
+                Button("Open", action: onEdit)
+            }
+            Button("Reveal in Finder", action: onReveal)
+        } label: {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(LinearGradient(colors: tileColors, startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 26, height: 26)
+                    .overlay(
+                        Image(systemName: isScript ? "terminal" : "doc.text")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                    )
+                    .shadow(color: (tileColors.last ?? .black).opacity(0.35), radius: 2, y: 1)
+                Text(file.lastPathComponent)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 6)
+                Image(systemName: isScript ? "play.circle.fill" : "ellipsis.circle")
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .opacity(hovering ? 1 : 0.55)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(hovering ? Palette.hover : Color.clear)
+            )
+            .padding(.horizontal, 6)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(maxWidth: .infinity)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -3226,6 +3710,16 @@ struct PreferencesView: View {
         )
     }
 
+    private var projectFoldersBinding: Binding<String> {
+        Binding(
+            get: { prefs.projectFolders.joined(separator: ", ") },
+            set: { prefs.projectFolders = $0
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty } }
+        )
+    }
+
     var body: some View {
         Form {
             Section("Terminal") {
@@ -3256,6 +3750,15 @@ struct PreferencesView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("New project template") {
+                TextField("Folders", text: projectFoldersBinding,
+                          prompt: Text("Repositories, Data, Scripts, Docs, Reference"))
+                    .textFieldStyle(.roundedBorder)
+                Text("Comma-separated folders created for each new project, plus a seeded CLAUDE.md and README.md.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Global hotkey") {
                 HotKeyField()
                 Text("Opens or closes the launcher from anywhere.")
@@ -3264,7 +3767,7 @@ struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 420)
+        .frame(width: 440, height: 500)
     }
 }
 
@@ -3543,12 +4046,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             uiState.selectionActive = false
             return nil
         case kVK_LeftArrow:
-            guard uiState.selectionActive else { return event }
-            if model.canGoBack {
-                model.navigateBack()
-                uiState.selection = 0
-                uiState.selectionActive = false
-            }
+            // Go back a level whenever the filter is empty — no need to first activate the
+            // selection with an arrow key. While typing a filter, let ← move the text cursor.
+            guard uiState.filterText.isEmpty else { return event }
+            guard model.canGoBack else { return event }
+            model.navigateBack()
+            uiState.selection = 0
+            uiState.selectionActive = false
             return nil
         case kVK_Escape:
             if !uiState.filterText.isEmpty { uiState.filterText = "" }
