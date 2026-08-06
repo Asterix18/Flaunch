@@ -40,10 +40,18 @@ final class FolderModel: ObservableObject {
     @Published var isCloning = false
     /// Flattened index of folders beneath the root, used by the top-level filter.
     @Published var searchIndex: [SearchEntry] = []
+    /// Progress line shown in the footer during a multi-repo git operation.
+    @Published var busyMessage: String?
     let recents = RecentFolders()
     let favorites = Favorites()
     let history = LaunchHistory()
     let prefs: Preferences
+    /// Cached git status for every repo the launcher has looked at.
+    let statusStore = GitStatusStore()
+    /// Claude history / last-activity per folder, used for subtitles and activity sorting.
+    let insights = InsightIndex()
+    /// Which folders have a Claude session running right now.
+    let active: ActiveSessions
 
     /// Ancestors of `currentURL` back up to `rootURL`, used by the back button.
     private var navigationStack: [URL] = []
@@ -52,8 +60,9 @@ final class FolderModel: ObservableObject {
 
     var canGoBack: Bool { !navigationStack.isEmpty }
 
-    init(prefs: Preferences) {
+    init(prefs: Preferences, active: ActiveSessions) {
         self.prefs = prefs
+        self.active = active
         restoreBookmark()
     }
 
@@ -184,7 +193,7 @@ final class FolderModel: ObservableObject {
             // Open the newly cloned repo directly in Claude, same as clicking any folder row.
             if openWhenDone,
                let cloned = self.subfolders.first(where: { !before.contains($0.lastPathComponent) }) {
-                self.openInTerminal(cloned)
+                self.launch(cloned)
             }
             completion?()
         }
@@ -411,11 +420,29 @@ final class FolderModel: ObservableObject {
         }
     }
 
-    private func rebuildSearchIndex() {
+    func rebuildSearchIndex() {
         guard let root = rootURL else { searchIndex = []; return }
+        // With "search all roots" on, every root the launcher has been pointed at is indexed, not
+        // just the current one — results from elsewhere are labelled with their root's name.
+        var roots: [(url: URL, label: String?)] = [(root, nil)]
+        if prefs.searchAllRoots {
+            for other in recents.folders where other.standardizedFileURL.path != root.standardizedFileURL.path {
+                // Nested roots duplicate entries whichever way round they're nested.
+                guard !other.path.hasPrefix(root.path + "/"),
+                      !root.path.hasPrefix(other.path + "/") else { continue }
+                let resolved = RootBookmarks.resolveAndAccess(path: other.standardizedFileURL.path) ?? other
+                roots.append((resolved, resolved.lastPathComponent))
+            }
+        }
+        let skip = Set(prefs.excludedFolderNames)
+        let depth = max(1, prefs.searchDepth)
+
         Task { [weak self] in
             let entries = await Task.detached(priority: .utility) {
-                FolderModel.indexDescendants(of: root)
+                roots.flatMap { root in
+                    FolderModel.indexDescendants(of: root.url, maxDepth: depth,
+                                                 skip: skip, rootLabel: root.label)
+                }
             }.value
             self?.searchIndex = entries
         }
@@ -423,11 +450,14 @@ final class FolderModel: ObservableObject {
 
     /// Walks the folder tree beneath `root` and returns every directory found, with its
     /// relative parent path. Descends up to `maxDepth` levels and stops at git repos
-    /// (so project internals like `node_modules` are never scanned), and skips a few
-    /// well-known heavy/build directories.
-    nonisolated private static func indexDescendants(of root: URL, maxDepth: Int = 4) -> [SearchEntry] {
-        let skip: Set<String> = ["node_modules", ".build", "DerivedData", "Pods",
-                                 "venv", ".venv", "__pycache__", ".git"]
+    /// (so project internals like `node_modules` are never scanned), and skips the
+    /// heavy/build directories configured in Settings.
+    ///
+    /// `rootLabel` prefixes the displayed path when indexing a root other than the current one,
+    /// so a result from a different root says where it came from.
+    nonisolated private static func indexDescendants(of root: URL, maxDepth: Int,
+                                                     skip: Set<String>,
+                                                     rootLabel: String?) -> [SearchEntry] {
         let fm = FileManager.default
         var result: [SearchEntry] = []
 
@@ -444,7 +474,10 @@ final class FolderModel: ObservableObject {
                 else { continue }
 
                 let rel = String(item.path.dropFirst(root.path.count + 1))
-                let parent = (rel as NSString).deletingLastPathComponent
+                var parent = (rel as NSString).deletingLastPathComponent
+                if let rootLabel {
+                    parent = parent.isEmpty ? rootLabel : "\(rootLabel)/\(parent)"
+                }
                 result.append(SearchEntry(url: item, relativePath: parent))
 
                 // Stop at project boundaries: don't scan inside a git repo.
@@ -494,6 +527,20 @@ final class FolderModel: ObservableObject {
         }
     }
 
+    /// Runs several scripts one after another in a single terminal (`a && b && …`), in the
+    /// given order, stopping at the first failure. All scripts live in the same folder.
+    func runScriptChain(_ files: [URL]) {
+        guard let first = files.first else { return }
+        let folder = first.deletingLastPathComponent()
+        history.record(folder)
+        let command = files.map { scriptRunCommand(for: $0) }.joined(separator: " && ")
+        if let error = TerminalLauncher.launch(
+            folder: folder, command: command, terminalBundleId: prefs.terminalBundleId
+        ) {
+            errorMessage = error
+        }
+    }
+
     /// Builds the shell command to run `file` (already cd'd into its folder): `./name` when
     /// executable, otherwise the matching interpreter by extension.
     private func scriptRunCommand(for file: URL) -> String {
@@ -532,37 +579,255 @@ final class FolderModel: ObservableObject {
         }
     }
 
+    // MARK: - Git actions
+
+    /// Opens the repo's `origin` remote in the browser (GitHub, Bitbucket, GitLab, or whatever
+    /// host it points at).
+    func openRemote(_ folder: URL) {
+        Task { [weak self] in
+            let url = await Task.detached(priority: .userInitiated) { Git.remoteWebURL(at: folder) }.value
+            guard let self else { return }
+            guard let url else {
+                self.errorMessage = "No browsable origin remote for \(folder.lastPathComponent)."
+                return
+            }
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Asks for a branch name, adds a worktree for it beside the repo, and launches Claude there
+    /// — the setup for working a branch in parallel with the main checkout.
+    func promptWorktree(for repo: URL) {
+        let alert = NSAlert()
+        alert.messageText = "New Worktree"
+        alert.informativeText = "Creates a linked worktree next to \(repo.lastPathComponent) and opens it."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.placeholderString = "branch name"
+        alert.accessoryView = input
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let branch = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branch.isEmpty else { return }
+
+        busyMessage = "Creating worktree…"
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Git.addWorktree(repo: repo, branch: branch)
+            }.value
+            guard let self else { return }
+            self.busyMessage = nil
+            switch result {
+            case .success(let worktree):
+                self.loadSubfolders()
+                self.launch(worktree)
+            case .failure(let error):
+                self.errorMessage = error.message
+            }
+        }
+    }
+
+    /// Fetches the given repos in the background, so the ahead/behind badges reflect the remote
+    /// as it is now rather than the last time anything fetched.
+    func fetchRepos(_ urls: [URL], force: Bool = false) {
+        let interval = force ? 0 : TimeInterval(max(1, prefs.fetchInterval) * 60)
+        let due = statusStore.repositoriesNeedingFetch(urls, interval: interval)
+        guard !due.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            if force { self.busyMessage = "Fetching \(due.count) repo\(due.count == 1 ? "" : "s")…" }
+            await self.statusStore.fetchSweep(due)
+            if force { self.busyMessage = nil }
+        }
+    }
+
+    /// Pulls every repo that's behind and clean, reporting what it did (and what it left alone).
+    /// A one-repo pull fetches first, so an explicit Pull can't answer "nothing to do" purely
+    /// because nothing had fetched recently.
+    func pullAll(_ urls: [URL]) {
+        let repos = urls.filter { $0.gitBranch != nil }
+        guard !repos.isEmpty else { return }
+        busyMessage = "Pulling…"
+        Task { [weak self] in
+            guard let self else { return }
+            let summary = await self.statusStore.pullAll(repos, fetchFirst: repos.count == 1) { message in
+                Task { @MainActor [weak self] in self?.busyMessage = message }
+            }
+            self.busyMessage = nil
+            self.insights.invalidate(repos)
+            self.insights.request(repos, maxAge: 0)
+            self.reportPull(summary)
+        }
+    }
+
+    private func reportPull(_ summary: GitStatusStore.PullSummary) {
+        var lines: [String] = []
+        if !summary.pulled.isEmpty { lines.append("Pulled: " + summary.pulled.joined(separator: ", ")) }
+        if !summary.skippedDirty.isEmpty {
+            lines.append("Skipped (uncommitted changes): " + summary.skippedDirty.joined(separator: ", "))
+        }
+        if !summary.failed.isEmpty { lines.append("Failed: " + summary.failed.joined(separator: ", ")) }
+        if lines.isEmpty { lines.append("Everything was already up to date.") }
+
+        let alert = NSAlert()
+        alert.messageText = summary.pulled.isEmpty ? "Nothing to pull" : "Pulled \(summary.pulled.count) repo\(summary.pulled.count == 1 ? "" : "s")"
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        NotificationCenter.default.post(name: .cflShowLauncher, object: nil)
+    }
+
+    /// Which Claude session a launch should join.
+    enum Resume: Equatable {
+        /// A brand-new session.
+        case none
+        /// `claude --continue` — pick up the most recent session in this folder.
+        case latest
+        /// `claude --resume <id>` — a specific past session.
+        case session(String)
+    }
+
+    /// The primary launch action — clicking a folder row, hitting Return, the toolbar button.
+    /// Sends the folder wherever its launch target points, optionally seeding the first prompt
+    /// or resuming an earlier session.
+    func launch(_ folder: URL, resume: Resume = .none) {
+        let target = prefs.effectiveLaunchTarget
+
+        // Something is already running here: offer that window rather than a second session in
+        // the same repo. Only for plain new sessions — an explicit resume is a request to start
+        // something, not to go back to what's there.
+        if prefs.reuseRunningSession, resume == .none, active.isActive(folder), target == .terminal {
+            if TerminalLauncher.focusExisting(title: sessionTitle(for: folder),
+                                              terminalBundleId: prefs.terminalBundleId) {
+                history.record(folder)
+                return
+            }
+        }
+
+        withPullPreflight(folder) { [weak self] pullFirst in
+            guard let self = self else { return }
+            switch target {
+            case .terminal:
+                self.launchTerminal(folder, runPullFirst: pullFirst, resume: resume)
+            case .claudeDesktop:
+                self.launchClaudeDesktop(folder, pullFirst: pullFirst)
+            }
+        }
+    }
+
     func openInTerminal(_ folder: URL, runClaude: Bool = true) {
         // A plain terminal just cd's in — skip the git upstream check entirely.
         guard runClaude else {
             launchTerminal(folder, runPullFirst: false, runClaude: false)
             return
         }
+        withPullPreflight(folder) { [weak self] pullFirst in
+            self?.launchTerminal(folder, runPullFirst: pullFirst)
+        }
+    }
 
-        // If it's a git repo, fetch and check whether the upstream is ahead before launching.
+    /// Opens several folders at once: one tab per folder in iTerm2, one window each elsewhere.
+    /// The desktop-app target just opens each folder in turn.
+    func launchBatch(_ folders: [URL]) {
+        guard !folders.isEmpty else { return }
+        var jobs: [TerminalLauncher.Job] = []
+        for folder in folders {
+            history.record(folder)
+            switch prefs.effectiveLaunchTarget {
+            case .terminal:
+                jobs.append(TerminalLauncher.Job(folder: folder,
+                                                 command: claudeCommand(),
+                                                 title: sessionTitle(for: folder)))
+            case .claudeDesktop:
+                if let error = ClaudeDesktop.open(folder: folder) { errorMessage = error }
+            }
+        }
+        guard !jobs.isEmpty else { return }
+        if let error = TerminalLauncher.launchAll(jobs, terminalBundleId: prefs.terminalBundleId) {
+            errorMessage = error
+        }
+    }
+
+    /// The tab title used for a folder's session — also the handle `focusExisting` searches by,
+    /// so it has to be unique. Bare folder names are not: every project here has a `Repositories`
+    /// and a `Docs`, and focusing the wrong one would hide the session you asked for.
+    func sessionTitle(for folder: URL) -> String {
+        let parent = folder.deletingLastPathComponent().lastPathComponent
+        return parent.isEmpty ? folder.lastPathComponent : "\(parent)/\(folder.lastPathComponent)"
+    }
+
+    /// Builds the shell command for a Claude launch: the configured command, adjusted for
+    /// resume mode.
+    private func claudeCommand(resume: Resume = .none) -> String {
+        var command = prefs.launchCommand.trimmingCharacters(in: .whitespaces).isEmpty
+            ? "claude" : prefs.launchCommand
+        if resume != .none {
+            // Drop any resume flags the configured command already carries, so they can't
+            // collide with the one being requested here.
+            command = FolderModel.strippingResumeFlags(command)
+        }
+        switch resume {
+        case .none:            break
+        case .latest:          command += " --continue"
+        case .session(let id): command += " --resume \(id)"
+        }
+        return command
+    }
+
+    /// Removes `--continue` / `-c` / `--resume [id]` from a command string.
+    static func strippingResumeFlags(_ command: String) -> String {
+        var parts = command.split(separator: " ").map(String.init)
+        var result: [String] = []
+        var index = 0
+        while index < parts.count {
+            let part = parts[index]
+            if part == "--continue" || part == "-c" {
+                index += 1
+                continue
+            }
+            if part == "--resume" || part == "-r" {
+                index += 1
+                // Swallow the session id, if one was given (the next token isn't a flag).
+                if index < parts.count, !parts[index].hasPrefix("-") { index += 1 }
+                continue
+            }
+            result.append(part)
+            index += 1
+        }
+        parts = result
+        return parts.joined(separator: " ")
+    }
+
+    /// If it's a git repo, fetches and — when the upstream has moved on — asks whether to pull
+    /// before launching. Calls `proceed` with whether the caller should pull first; on cancel it
+    /// isn't called at all, so nothing launches.
+    private func withPullPreflight(_ folder: URL, proceed: @escaping (Bool) -> Void) {
         guard folder.gitBranch != nil else {
-            launchTerminal(folder, runPullFirst: false)
+            proceed(false)
             return
         }
-
         Task { [weak self] in
             let behind = await Task.detached(priority: .userInitiated) {
                 Git.fetchAndCountBehindUpstream(at: folder)
             }.value
             await MainActor.run {
                 guard let self = self else { return }
-                if behind > 0 {
-                    let pull = self.confirmPull(behind: behind, folder: folder)
-                    switch pull {
-                    case .pullAndOpen:
-                        self.launchTerminal(folder, runPullFirst: true)
-                    case .openAnyway:
-                        self.launchTerminal(folder, runPullFirst: false)
-                    case .cancel:
-                        return
-                    }
-                } else {
-                    self.launchTerminal(folder, runPullFirst: false)
+                guard behind > 0 else {
+                    proceed(false)
+                    return
+                }
+                switch self.confirmPull(behind: behind, folder: folder) {
+                case .pullAndOpen: proceed(true)
+                case .openAnyway:  proceed(false)
+                case .cancel:      return
                 }
             }
         }
@@ -589,22 +854,50 @@ final class FolderModel: ObservableObject {
         }
     }
 
-    private func launchTerminal(_ folder: URL, runPullFirst: Bool, runClaude: Bool = true) {
+    private func launchTerminal(_ folder: URL, runPullFirst: Bool, runClaude: Bool = true,
+                                resume: Resume = .none) {
         history.record(folder)
+        insights.invalidate([folder])
         // A plain terminal just cd's in (command == nil); the Claude variants run the configured
         // launch command, optionally pulling first.
         let command: String?
         if !runClaude {
             command = nil
-        } else if runPullFirst {
-            command = "git pull && \(prefs.launchCommand)"
         } else {
-            command = prefs.launchCommand
+            let claude = claudeCommand(resume: resume)
+            command = runPullFirst ? "git pull && \(claude)" : claude
         }
         if let error = TerminalLauncher.launch(
-            folder: folder, command: command, terminalBundleId: prefs.terminalBundleId
+            folder: folder, command: command,
+            terminalBundleId: prefs.terminalBundleId,
+            title: sessionTitle(for: folder)
         ) {
             errorMessage = error
+        }
+    }
+
+    /// Opens `folder` as a Code session in the desktop app. Unlike the terminal path there's no
+    /// shell to chain `git pull &&` onto, so the pull has to run here first.
+    private func launchClaudeDesktop(_ folder: URL, pullFirst: Bool) {
+        history.record(folder)
+        insights.invalidate([folder])
+        guard pullFirst else {
+            if let error = ClaudeDesktop.open(folder: folder) { errorMessage = error }
+            return
+        }
+        Task { [weak self] in
+            let failure = await Task.detached(priority: .userInitiated) {
+                Git.pull(at: folder)
+            }.value
+            await MainActor.run {
+                guard let self = self else { return }
+                // A failed open is the more useful thing to report, so it wins.
+                if let error = ClaudeDesktop.open(folder: folder) {
+                    self.errorMessage = error
+                } else if let failure = failure {
+                    self.errorMessage = failure
+                }
+            }
         }
     }
 
@@ -621,6 +914,8 @@ final class FolderModel: ObservableObject {
         } catch {
             // Bookmark persistence is best-effort; ignore failures.
         }
+        // Also remembered per root, so "search all roots" can still read the others later.
+        RootBookmarks.save(url)
     }
 
     private func restoreBookmark() {
@@ -760,8 +1055,20 @@ enum Git {
         return count
     }
 
+    /// Pulls the current branch. Returns nil on success or a human-readable error.
+    /// Used by launch targets with no shell to chain `git pull &&` onto.
+    static func pull(at folder: URL) -> String? {
+        guard run(["pull", "--quiet"], at: folder, timeout: 120) != nil else {
+            return "git pull failed — opened without pulling."
+        }
+        return nil
+    }
+
+    /// Runs a git subcommand in `folder`, returning stdout on success and nil on any failure
+    /// (non-zero exit, timeout, git missing). Internal so the extras in `GitExtras.swift` can
+    /// share one runner.
     @discardableResult
-    private static func run(_ args: [String], at folder: URL, timeout: TimeInterval = 5) -> String? {
+    static func run(_ args: [String], at folder: URL, timeout: TimeInterval = 5) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = args
@@ -777,16 +1084,15 @@ enum Git {
             return nil
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if process.isRunning {
-            process.terminate()
-            return nil
-        }
-        guard process.terminationStatus == 0 else { return nil }
+        // A watchdog rather than a poll loop: polling put a 50ms floor under every git call, and
+        // these run per-repo.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
         let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+
+        guard process.terminationStatus == 0 else { return nil }
         return String(data: data, encoding: .utf8)
     }
 }
@@ -814,6 +1120,79 @@ enum Editors {
     }
 }
 
+// MARK: - Claude desktop app
+
+/// Where the primary launch action sends a folder.
+enum LaunchTarget: String, CaseIterable, Identifiable {
+    case terminal
+    case claudeDesktop
+
+    var id: String { rawValue }
+
+    /// Name shown in the settings picker.
+    var name: String {
+        switch self {
+        case .terminal:      return "Terminal"
+        case .claudeDesktop: return "Claude desktop app"
+        }
+    }
+
+    /// Wording for the primary launch action in menus.
+    var actionLabel: String {
+        switch self {
+        case .terminal:      return "Open in Terminal with Claude"
+        case .claudeDesktop: return "Open in Claude"
+        }
+    }
+
+}
+
+/// The Claude desktop app.
+///
+/// Folders go over the `claude://code/new?folder=…` deep link, which opens a Code session in
+/// that directory. Handing the app a folder the obvious way — `open -a Claude <folder>` — looks
+/// like it should work (it registers as a `public.folder` handler) but routes to Cowork instead,
+/// so the deep link is the only way to land in Code.
+///
+/// The app shows a one-time trust prompt per folder before adopting it.
+enum ClaudeDesktop {
+    static let bundleId = "com.anthropic.claudefordesktop"
+
+    static var isInstalled: Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil
+    }
+
+    /// Percent-encoding set for a query *value*. `URLComponents.queryItems` would use
+    /// `urlQueryAllowed`, which leaves `&`, `=` and `+` intact — a folder like `PROJECTS/R&D`
+    /// would then split the query, and a `+` in a path can come back out as a space.
+    private static let queryValueAllowed: CharacterSet = {
+        var set = CharacterSet.urlQueryAllowed
+        set.remove(charactersIn: "&=+?#")
+        return set
+    }()
+
+    private static func encode(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? value
+    }
+
+    /// Deep link for a Code session in `folder`.
+    static func codeSessionURL(folder: URL) -> URL? {
+        URL(string: "claude://code/new?folder=\(encode(folder.path))")
+    }
+
+    /// Opens `folder` as a Code session. Returns nil on success or a human-readable error.
+    static func open(folder: URL) -> String? {
+        guard isInstalled else { return "The Claude desktop app isn't installed." }
+        guard let url = codeSessionURL(folder: folder) else {
+            return "Could not build the Claude deep link."
+        }
+        guard NSWorkspace.shared.open(url) else {
+            return "Claude wouldn't open that folder — deep links may be disabled."
+        }
+        return nil
+    }
+}
+
 // MARK: - Preferences
 
 extension Notification.Name {
@@ -830,6 +1209,8 @@ extension Notification.Name {
 /// and observed by the AppDelegate (for the hotkey).
 @MainActor
 final class Preferences: ObservableObject {
+    /// Where clicking a folder sends it (defaults to the terminal).
+    @Published var launchTarget: LaunchTarget { didSet { d.set(launchTarget.rawValue, forKey: Keys.launchTarget) } }
     /// Bundle id of the terminal app launches open in (defaults to Terminal.app).
     @Published var terminalBundleId: String { didSet { d.set(terminalBundleId, forKey: Keys.terminal) } }
     /// Command run after cd-ing into a folder (defaults to `claude`).
@@ -842,10 +1223,31 @@ final class Preferences: ObservableObject {
     @Published var shownFoldersByRoot: [String: [String]] { didSet { d.set(shownFoldersByRoot, forKey: Keys.shown) } }
     /// Folder names created inside each new project scaffold (plus a seeded CLAUDE.md and README.md).
     @Published var projectFolders: [String] { didSet { d.set(projectFolders, forKey: Keys.projectFolders) } }
+    /// Order folders by when they were last worked on (commits, Claude sessions, file changes)
+    /// instead of alphabetically.
+    @Published var sortByActivity: Bool { didSet { d.set(sortByActivity, forKey: Keys.sortByActivity) } }
+    /// Fetch visible repos in the background so the ahead/behind counters stay honest.
+    @Published var autoFetch: Bool { didSet { d.set(autoFetch, forKey: Keys.autoFetch) } }
+    /// Minimum minutes between background fetches of the same repo.
+    @Published var fetchInterval: Int { didSet { d.set(fetchInterval, forKey: Keys.fetchInterval) } }
+    /// When a folder already has a Claude session running, offer to focus it instead of
+    /// silently starting a second one.
+    @Published var reuseRunningSession: Bool { didSet { d.set(reuseRunningSession, forKey: Keys.reuseSession) } }
+    /// Search every root the launcher has been pointed at, not just the current one.
+    @Published var searchAllRoots: Bool { didSet { d.set(searchAllRoots, forKey: Keys.searchAllRoots) } }
+    /// Directory names the deep-search index never descends into.
+    @Published var excludedFolderNames: [String] { didSet { d.set(excludedFolderNames, forKey: Keys.excluded) } }
+    /// How many levels below a root the deep-search index walks.
+    @Published var searchDepth: Int { didSet { d.set(searchDepth, forKey: Keys.searchDepth) } }
     /// Global hotkey virtual key code + Carbon modifier mask, plus a display string.
     @Published private(set) var hotKeyCode: UInt32
     @Published private(set) var hotKeyModifiers: UInt32
     @Published private(set) var hotKeyDisplay: String
+
+    static let defaultExcluded = [
+        "node_modules", ".build", "DerivedData", "Pods", "venv", ".venv", "__pycache__",
+        ".git", "dist", "target", ".next",
+    ]
 
     static let defaultHotKeyCode = UInt32(kVK_ANSI_C)
     static let defaultHotKeyModifiers = UInt32(controlKey | optionKey)
@@ -853,11 +1255,19 @@ final class Preferences: ObservableObject {
 
     private let d = UserDefaults.standard
     private enum Keys {
+        static let launchTarget = "CFL.launchTarget"
         static let terminal = "CFL.terminalBundleId"
         static let command = "CFL.launchCommand"
         static let featured = "CFL.featuredFolders"
         static let shown = "CFL.shownFoldersByRoot"
         static let projectFolders = "CFL.projectFolders"
+        static let sortByActivity = "CFL.sortByActivity"
+        static let autoFetch = "CFL.autoFetch"
+        static let fetchInterval = "CFL.fetchIntervalMinutes"
+        static let reuseSession = "CFL.reuseRunningSession"
+        static let searchAllRoots = "CFL.searchAllRoots"
+        static let excluded = "CFL.excludedFolderNames"
+        static let searchDepth = "CFL.searchDepth"
         static let hkCode = "CFL.hotKeyCode"
         static let hkMods = "CFL.hotKeyModifiers"
         static let hkDisplay = "CFL.hotKeyDisplay"
@@ -865,12 +1275,20 @@ final class Preferences: ObservableObject {
 
     init() {
         let store = UserDefaults.standard
+        launchTarget = LaunchTarget(rawValue: store.string(forKey: Keys.launchTarget) ?? "") ?? .terminal
         terminalBundleId = store.string(forKey: Keys.terminal) ?? "com.apple.Terminal"
         launchCommand = store.string(forKey: Keys.command) ?? "claude"
         featuredFolderNames = store.stringArray(forKey: Keys.featured) ?? ["PROJECTS", "OTHER STUFF"]
         shownFoldersByRoot = (store.dictionary(forKey: Keys.shown) as? [String: [String]]) ?? [:]
         projectFolders = store.stringArray(forKey: Keys.projectFolders)
             ?? ["Repositories", "Data", "Scripts", "Docs", "Reference"]
+        sortByActivity = store.bool(forKey: Keys.sortByActivity)
+        autoFetch = store.object(forKey: Keys.autoFetch) as? Bool ?? true
+        fetchInterval = store.object(forKey: Keys.fetchInterval) as? Int ?? 10
+        reuseRunningSession = store.object(forKey: Keys.reuseSession) as? Bool ?? true
+        searchAllRoots = store.bool(forKey: Keys.searchAllRoots)
+        excludedFolderNames = store.stringArray(forKey: Keys.excluded) ?? Preferences.defaultExcluded
+        searchDepth = store.object(forKey: Keys.searchDepth) as? Int ?? 4
         hotKeyCode = store.object(forKey: Keys.hkCode) != nil
             ? UInt32(store.integer(forKey: Keys.hkCode)) : Preferences.defaultHotKeyCode
         hotKeyModifiers = store.object(forKey: Keys.hkMods) != nil
@@ -893,6 +1311,12 @@ final class Preferences: ObservableObject {
         setHotKey(code: Preferences.defaultHotKeyCode,
                   modifiers: Preferences.defaultHotKeyModifiers,
                   display: Preferences.defaultHotKeyDisplay)
+    }
+
+    /// The launch target actually used. Falls back to the terminal if the desktop app has since
+    /// been uninstalled, so a stale preference can't leave clicking a folder doing nothing.
+    var effectiveLaunchTarget: LaunchTarget {
+        (launchTarget == .claudeDesktop && !ClaudeDesktop.isInstalled) ? .terminal : launchTarget
     }
 
     /// The subfolder names chosen to show at `root`, or nil if it's never been set up
@@ -957,44 +1381,143 @@ enum Terminals {
 /// Opens a folder in the user's chosen terminal, optionally running a command after cd-ing in.
 /// Returns nil on success or a human-readable error.
 enum TerminalLauncher {
-    static func launch(folder: URL, command: String?, terminalBundleId: String) -> String? {
+    /// One folder to open, with the command to run in it and the title its tab should carry.
+    /// Titles are what makes a window findable later, so `focusExisting` can bring you back to
+    /// a running session instead of starting a second one.
+    struct Job {
+        let folder: URL
+        let command: String?
+        var title: String?
+    }
+
+    static func launch(folder: URL, command: String?, terminalBundleId: String,
+                       title: String? = nil) -> String? {
+        launchAll([Job(folder: folder, command: command, title: title)],
+                  terminalBundleId: terminalBundleId)
+    }
+
+    /// Opens every job. iTerm2 gets one tab per job in a single window; Terminal.app has no
+    /// scriptable "new tab" (it needs an Accessibility-permission keystroke), so it gets one
+    /// window each, as do the CLI-launched terminals.
+    static func launchAll(_ jobs: [Job], terminalBundleId: String) -> String? {
+        guard !jobs.isEmpty else { return nil }
         let terminal = Terminals.byId(terminalBundleId)
             ?? Terminals.byId("com.apple.Terminal")!
         switch terminal.strategy {
-        case .terminalApp: return launchAppleScript(folder, command, flavor: .terminal)
-        case .iterm:       return launchAppleScript(folder, command, flavor: .iterm)
-        case .openArgs(let build): return launchViaOpen(terminal, folder, command, build)
-        case .warp:        return launchWarp(folder)
+        case .terminalApp:
+            return runAppleScript(terminalAppScript(jobs))
+        case .iterm:
+            return runAppleScript(itermScript(jobs))
+        case .openArgs(let build):
+            for job in jobs {
+                if let error = launchViaOpen(terminal, job.folder, job.command, build) { return error }
+            }
+            return nil
+        case .warp:
+            for job in jobs {
+                if let error = launchWarp(job.folder) { return error }
+            }
+            return nil
         }
     }
 
-    private enum Flavor { case terminal, iterm }
-
-    private static func launchAppleScript(_ folder: URL, _ command: String?, flavor: Flavor) -> String? {
-        let cd = "cd \(shellQuote(folder.path))"
-        let full = command.map { "\(cd) && \($0)" } ?? cd
-        let escaped = appleEscape(full)
+    /// Brings an existing tab titled `title` to the front. Returns true when one was found.
+    /// Only Terminal.app and iTerm2 can be searched this way; other terminals report false so
+    /// the caller opens a new window instead.
+    static func focusExisting(title: String, terminalBundleId: String) -> Bool {
+        guard let terminal = Terminals.byId(terminalBundleId) else { return false }
+        let needle = appleEscape(title)
         let script: String
-        switch flavor {
-        case .terminal:
+        switch terminal.strategy {
+        case .terminalApp:
             script = """
             tell application "Terminal"
-                activate
-                do script "\(escaped)"
+                set matched to false
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        try
+                            if custom title of t is "\(needle)" then
+                                set selected of t to true
+                                set index of w to 1
+                                set matched to true
+                            end if
+                        end try
+                    end repeat
+                end repeat
+                if matched then activate
+                return matched
             end tell
             """
         case .iterm:
             script = """
             tell application "iTerm"
-                activate
-                set newWindow to (create window with default profile)
-                tell current session of newWindow
-                    write text "\(escaped)"
-                end tell
+                set matched to false
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        repeat with s in sessions of t
+                            try
+                                if name of s is "\(needle)" then
+                                    select t
+                                    select w
+                                    set matched to true
+                                end if
+                            end try
+                        end repeat
+                    end repeat
+                end repeat
+                if matched then activate
+                return matched
             end tell
             """
+        case .openArgs, .warp:
+            return false
         }
-        return runAppleScript(script)
+        return runAppleScriptReturningBool(script)
+    }
+
+    private static func terminalAppScript(_ jobs: [Job]) -> String {
+        let blocks = jobs.map { job -> String in
+            let escaped = appleEscape(shellLine(job))
+            var block = "    set t to do script \"\(escaped)\"\n"
+            if let title = job.title {
+                block += "    set custom title of t to \"\(appleEscape(title))\"\n"
+            }
+            return block
+        }.joined()
+        return """
+        tell application "Terminal"
+            activate
+        \(blocks)end tell
+        """
+    }
+
+    private static func itermScript(_ jobs: [Job]) -> String {
+        var body = """
+        tell application "iTerm"
+            activate
+            set w to (create window with default profile)
+        """
+        for (index, job) in jobs.enumerated() {
+            let escaped = appleEscape(shellLine(job))
+            // The window arrives with one session; every job after the first adds a tab to it.
+            body += index == 0
+                ? "\n    set s to current session of w"
+                : "\n    tell w to set s to current session of (create tab with default profile)"
+            body += "\n    tell s"
+            body += "\n        write text \"\(escaped)\""
+            if let title = job.title {
+                body += "\n        set name to \"\(appleEscape(title))\""
+            }
+            body += "\n    end tell"
+        }
+        body += "\nend tell"
+        return body
+    }
+
+    /// `cd` into the folder, then the command (when there is one).
+    private static func shellLine(_ job: Job) -> String {
+        let cd = "cd \(shellQuote(job.folder.path))"
+        return job.command.map { "\(cd) && \($0)" } ?? cd
     }
 
     private static func launchViaOpen(_ term: TerminalOption, _ folder: URL, _ command: String?,
@@ -1019,7 +1542,7 @@ enum TerminalLauncher {
     // MARK: helpers
 
     /// Single-quotes a string for safe interpolation into a shell command.
-    private static func shellQuote(_ s: String) -> String {
+    static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
@@ -1038,6 +1561,16 @@ enum TerminalLauncher {
             return "Failed to launch terminal: \(message ?? "\(errorInfo)")"
         }
         return nil
+    }
+
+    /// Runs a script that answers a yes/no question (e.g. "did you find that tab?").
+    /// Any failure counts as "no", so callers fall back to opening something new.
+    private static func runAppleScriptReturningBool(_ source: String) -> Bool {
+        guard let script = NSAppleScript(source: source) else { return false }
+        var errorInfo: NSDictionary?
+        let result = script.executeAndReturnError(&errorInfo)
+        guard errorInfo == nil else { return false }
+        return result.booleanValue
     }
 
     private static func runOpen(_ args: [String], appName: String) -> String? {
@@ -1247,6 +1780,16 @@ struct NavItem {
 final class UIState: ObservableObject {
     @Published var filterText = ""
     @Published var selection = 0
+    /// Multi-select: clicking rows queues folders instead of launching them, then one action
+    /// opens them all together.
+    @Published var batchMode = false
+    /// Queued folder paths, in click order.
+    @Published var batchSelection: [String] = []
+    /// Bumped every time the launcher is shown, so views can re-read anything that may have
+    /// changed while it was closed.
+    @Published var openCount = 0
+    /// Bumped on Escape, so views can drop transient modes of their own (the Scripts chain).
+    @Published var escapePresses = 0
     /// The selection highlight only shows once the user starts arrow-key navigation —
     /// otherwise a row would look selected the moment the popover opens.
     @Published var selectionActive = false
@@ -1255,6 +1798,19 @@ final class UIState: ObservableObject {
     var navItems: [NavItem] = []
     /// Hidden side-scroller easter egg, shared so the key monitor can feed it jumps.
     let runner = RunnerGame()
+
+    func toggleBatch(_ url: URL) {
+        if let index = batchSelection.firstIndex(of: url.path) {
+            batchSelection.remove(at: index)
+        } else {
+            batchSelection.append(url.path)
+        }
+    }
+
+    func endBatch() {
+        batchMode = false
+        batchSelection = []
+    }
 }
 
 // MARK: - Launch at login
@@ -1297,7 +1853,14 @@ struct ContentView: View {
     @EnvironmentObject var favorites: Favorites
     @EnvironmentObject var history: LaunchHistory
     @EnvironmentObject var prefs: Preferences
+    @EnvironmentObject var insights: InsightIndex
+    @EnvironmentObject var statusStore: GitStatusStore
     @StateObject private var launchAtLogin = LaunchAtLogin()
+
+    /// Chain mode in the Scripts view: clicking scripts queues them in click order,
+    /// then Run executes the queue sequentially in one terminal.
+    @State private var chainMode = false
+    @State private var chain: [URL] = []
 
     private var filterText: String { uiState.filterText }
 
@@ -1316,14 +1879,18 @@ struct ContentView: View {
 
     private var filteredSubfolders: [URL] {
         guard !filterText.isEmpty else { return visibleSubfolders }
-        return visibleSubfolders
-            .compactMap { url in Fuzzy.score(filterText, url.lastPathComponent).map { (url, $0) } }
-            .sorted {
-                $0.1 != $1.1
-                    ? $0.1 > $1.1
-                    : $0.0.lastPathComponent.localizedCaseInsensitiveCompare($1.0.lastPathComponent) == .orderedAscending
-            }
-            .map { $0.0 }
+        let query = filterText
+        var scored: [(url: URL, score: Int)] = []
+        for url in visibleSubfolders {
+            guard let score = Fuzzy.score(query, url.lastPathComponent) else { continue }
+            scored.append((url, score))
+        }
+        scored.sort { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.url.lastPathComponent.localizedCaseInsensitiveCompare(b.url.lastPathComponent)
+                == .orderedAscending
+        }
+        return scored.map(\.url)
     }
 
     /// The configured featured folders, in order, that are visible at the current level.
@@ -1346,9 +1913,21 @@ struct ContentView: View {
         return filteredSubfolders.filter { !special.contains($0.lastPathComponent) }
     }
 
-    private var gitFolders: [URL] { listedSubfolders.filter { $0.gitBranch != nil } }
-    private var plainFolders: [URL] { listedSubfolders.filter { $0.gitBranch == nil } }
-    private var showsSectionHeaders: Bool { !gitFolders.isEmpty && !plainFolders.isEmpty }
+    /// One list, in display order. Repos used to be split out under their own header, but the
+    /// branch badge already marks them and the split cost two headers and a surprising reorder.
+    private var displayedFolders: [URL] { sortedForDisplay(listedSubfolders) }
+
+    /// With "sort by activity" on, folders are ordered by the most recent signal of any kind —
+    /// a commit, a Claude session, or a file change — so what you touched last floats up even if
+    /// you never opened it through Flaunch. Otherwise the model's alphabetical order stands.
+    private func sortedForDisplay(_ urls: [URL]) -> [URL] {
+        guard prefs.sortByActivity else { return urls }
+        return urls.sorted { a, b in
+            let da = insights.activity(for: a), db = insights.activity(for: b)
+            if da != db { return da > db }
+            return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
+        }
+    }
 
     // MARK: Project view (a folder holding the standard template structure)
 
@@ -1455,14 +2034,23 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
             }
+            // The project's own files start the line below the title; actions follow on their own
+            // row. All five pills on one line don't fit 340pt without squeezing their labels.
+            if fm.fileExists(atPath: claude.path) || fm.fileExists(atPath: readme.path) {
+                HStack(spacing: 6) {
+                    if fm.fileExists(atPath: claude.path) {
+                        projectPill("CLAUDE.md") { model.openFile(claude) }
+                    }
+                    if fm.fileExists(atPath: readme.path) {
+                        projectPill("README") { model.openFile(readme) }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
             HStack(spacing: 6) {
-                if fm.fileExists(atPath: claude.path) {
-                    projectPill("CLAUDE.md") { model.openFile(claude) }
+                if insights.insight(for: project)?.sessions != nil {
+                    projectPill("Resume") { model.launch(project, resume: .latest) }
                 }
-                if fm.fileExists(atPath: readme.path) {
-                    projectPill("README") { model.openFile(readme) }
-                }
-                projectPill("Terminal") { model.openInTerminal(project) }
                 projectPill("Add repo") { model.promptAddRepositories(to: project) }
                 Spacer(minLength: 0)
             }
@@ -1472,7 +2060,8 @@ struct ContentView: View {
     }
 
     /// The Scripts folder view: subfolders (browse in) plus runnable script files. Clicking a
-    /// file opens a menu (Run / Open in Terminal / Edit / Reveal).
+    /// file opens a menu (Run / Open in Terminal / Edit / Reveal). Chain mode instead queues
+    /// scripts in click order and runs them back-to-back in one terminal.
     @ViewBuilder
     private var scriptsContent: some View {
         let subs = scriptSubfolders
@@ -1493,30 +2082,99 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     ForEach(Array(subs.enumerated()), id: \.element) { i, folder in
                         FolderRow(url: folder, isSelected: isSelected(i))
+                            .opacity(chainMode ? 0.35 : 1)
+                            .allowsHitTesting(!chainMode)
                     }
                     ForEach(fs, id: \.self) { file in
                         ScriptRow(
                             file: file,
                             isScript: model.isScript(file),
+                            chainMode: chainMode,
+                            chainIndex: chain.firstIndex(of: file).map { $0 + 1 },
                             onRun:      { model.runScript(file) },
                             onTerminal: { model.openInTerminal(file.deletingLastPathComponent(), runClaude: false) },
                             onEdit:     { model.openFile(file) },
-                            onReveal:   { model.revealInFinder(file) }
+                            onReveal:   { model.revealInFinder(file) },
+                            onChainToggle: { toggleChain(file) }
                         )
                     }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 4)
             }
-            .frame(height: min(max(CGFloat(subs.count + fs.count) * rowHeight + 8, rowHeight + 8), listMaxHeight))
+            .frame(height: min(max(subs.reduce(CGFloat(0)) { $0 + folderRowHeight($1) }
+                                   + CGFloat(fs.count) * rowHeight + 8,
+                                   rowHeight + 8), listMaxHeight))
+            if fs.filter({ model.isScript($0) }).count >= 2 {
+                Divider()
+                chainBar
+            }
         }
+    }
+
+    /// Footer of the Scripts view: the "Chain scripts" entry point, or — once active —
+    /// the queued order, a Run button, and cancel.
+    private var chainBar: some View {
+        HStack(spacing: 8) {
+            if chainMode {
+                Text(chain.isEmpty
+                     ? "Click scripts in the order to run them"
+                     : chain.map(\.lastPathComponent).joined(separator: " → "))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 6)
+                Button(chain.count > 1 ? "Run \(chain.count)" : "Run") { runChain() }
+                    .controlSize(.small)
+                    .disabled(chain.count < 2)
+                Button {
+                    chainMode = false
+                    chain = []
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel chain")
+            } else {
+                Button {
+                    chainMode = true
+                } label: {
+                    Label("Chain scripts", systemImage: "link")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Pick scripts in order, then run them one after another")
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private func toggleChain(_ file: URL) {
+        if let i = chain.firstIndex(of: file) {
+            chain.remove(at: i)      // deselect — later scripts renumber automatically
+        } else {
+            chain.append(file)
+        }
+    }
+
+    private func runChain() {
+        model.runScriptChain(chain)
+        chainMode = false
+        chain = []
     }
 
     private func projectPill(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
+            // Deliberately not fixedSize: a long label (an editor name, say) should truncate
+            // rather than push the header wider than the popover.
             Text(title)
                 .font(.system(size: 10, weight: .medium))
-                .fixedSize()
+                .lineLimit(1)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 4)
                 .background(Color.secondary.opacity(0.14))
@@ -1547,9 +2205,25 @@ struct ContentView: View {
 
     private var showsShortcuts: Bool { !model.canGoBack && filterText.isEmpty }
     private var pinnedEntries: [SearchEntry] { showsShortcuts ? model.pinnedEntries : [] }
-    private var recentEntries: [SearchEntry] { showsShortcuts ? model.recentEntries() : [] }
+    /// Recent folders worth showing: not the folder we're already in, and not one that's already
+    /// listed as a row below — the section used to repeat what was on screen.
+    private var recentEntries: [SearchEntry] {
+        guard showsShortcuts else { return [] }
+        let current = model.currentURL?.standardizedFileURL.path
+        let onScreen = Set(model.subfolders.map(\.standardizedFileURL.path))
+        return Array(model.recentEntries(limit: 8)
+            .filter { $0.url.standardizedFileURL.path != current }
+            .filter { !onScreen.contains($0.url.standardizedFileURL.path) }
+            .prefix(3))
+    }
 
-    // MARK: Keyboard navigation
+    /// Pinned and recent rows only need enough context to tell two same-named folders apart, so
+    /// they show the parent folder's name rather than the whole chain.
+    private func parentLabel(_ url: URL) -> String {
+        url.deletingLastPathComponent().lastPathComponent
+    }
+
+
 
     /// Everything the arrow keys walk through, in the exact order it's displayed:
     /// featured shortcuts, then Pinned, then Recent, then the git/plain folder rows.
@@ -1574,17 +2248,15 @@ struct ContentView: View {
             items += pinnedEntries.map { NavItem(url: $0.url, kind: .jump) }
             items += recentEntries.map { NavItem(url: $0.url, kind: .jump) }
         }
-        items += gitFolders.map { NavItem(url: $0, kind: .folder) }
-        items += plainFolders.map { NavItem(url: $0, kind: .folder) }
+        items += displayedFolders.map { NavItem(url: $0, kind: .folder) }
         return items
     }
 
     // Where each section starts within navItems, so a row can tell if it's the selected one.
     private var featuredBase: Int { 0 }
     private var pinnedBase: Int { showsHero ? specialFolders.count : 0 }
-    private var recentBase: Int { pinnedBase + (showsShortcuts ? pinnedEntries.count : 0) }
-    private var gitBase: Int { recentBase + (showsShortcuts ? recentEntries.count : 0) }
-    private var plainBase: Int { gitBase + gitFolders.count }
+    private var recentBase: Int { pinnedBase + pinnedEntries.count }
+    private var folderBase: Int { recentBase + recentEntries.count }
 
     private func isSelected(_ index: Int) -> Bool {
         uiState.selectionActive && uiState.selection == index
@@ -1635,16 +2307,90 @@ struct ContentView: View {
                     searchField
                 }
                 content
+                if uiState.batchMode {
+                    Divider()
+                    batchBar
+                }
             }
             Divider()
             footer
         }
         .frame(width: 340)
-        .onAppear(perform: syncNav)
+        .onAppear {
+            syncNav()
+            refreshVisible()
+        }
         .onChange(of: uiState.filterText) { _ in resetSelection(); syncNav() }
-        .onChange(of: model.subfolders) { _ in syncNav() }
-        .onChange(of: model.currentURL) { _ in resetSelection(); syncNav() }
+        .onChange(of: model.subfolders) { _ in
+            syncNav()
+            refreshVisible()
+        }
+        .onChange(of: model.currentURL) { _ in
+            resetSelection(); syncNav()
+            chainMode = false; chain = []
+            uiState.endBatch()
+        }
+        .onChange(of: uiState.escapePresses) { _ in
+            chainMode = false; chain = []
+        }
         .onChange(of: model.searchIndex) { _ in syncNav() }
+        // Activity data arrives asynchronously and reorders the list; without these the keyboard
+        // list keeps the pre-sort order and Return opens the wrong folder.
+        .onChange(of: insights.byPath) { _ in syncNav() }
+        .onChange(of: prefs.sortByActivity) { _ in syncNav() }
+        .onChange(of: favorites.paths) { _ in syncNav() }
+        // Reopening the launcher is the moment to re-read everything that may have moved on
+        // while it was closed.
+        .onChange(of: uiState.openCount) { _ in refreshVisible() }
+        .onChange(of: prefs.searchAllRoots) { _ in model.rebuildSearchIndex() }
+        .onChange(of: prefs.excludedFolderNames) { _ in model.rebuildSearchIndex() }
+        .onChange(of: prefs.searchDepth) { _ in model.rebuildSearchIndex() }
+    }
+
+    /// Refreshes what's cheap-but-stale for the folders currently on screen: activity dates,
+    /// which folders have Claude running (for session reuse), and — when enabled — a background
+    /// fetch so the ahead/behind counters aren't lying.
+    private func refreshVisible() {
+        let visible = model.subfolders
+        insights.request(visible)
+        insights.request(pinnedEntries.map(\.url) + recentEntries.map(\.url))
+        // The folder being browsed needs its own insight too — the project header's Resume pill
+        // and the header menu read it.
+        if let current = model.currentURL { insights.request([current]) }
+        model.active.refresh()
+        if prefs.autoFetch {
+            model.fetchRepos(visible)
+        }
+    }
+
+    /// Multi-select footer: shows what's queued and opens the lot together.
+    private var batchBar: some View {
+        HStack(spacing: 8) {
+            Text(uiState.batchSelection.isEmpty
+                 ? "Click folders to queue them"
+                 : uiState.batchSelection
+                    .map { URL(fileURLWithPath: $0).lastPathComponent }
+                    .joined(separator: " · "))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 6)
+            Button(uiState.batchSelection.count > 1 ? "Open \(uiState.batchSelection.count)" : "Open") {
+                model.launchBatch(uiState.batchSelection.map { URL(fileURLWithPath: $0) })
+                uiState.endBatch()
+            }
+            .controlSize(.small)
+            .disabled(uiState.batchSelection.isEmpty)
+            Button(action: uiState.endBatch) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Cancel")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
     }
 
     /// A faint grey gradient behind the header to tie the window to the card look.
@@ -1663,21 +2409,33 @@ struct ContentView: View {
     // Featured rows and search-result-style rows (pinned/recent) are two lines, so a touch taller.
     private let featuredRowHeight: CGFloat = 46
     private let entryRowHeight: CGFloat = 44
+    // Two-line rows whose second line carries a branch badge need a little more room.
+    private let badgeRowHeight: CGFloat = 48
 
-    /// Sizes the root list to its content: featured rows + pinned/recent + folders, plus headers.
+    /// A folder row grows a second line when it shows a path (pinned, recent, search results),
+    /// and a little more when a branch badge shares that line.
+    private func folderRowHeight(_ url: URL, hasPath: Bool = false) -> CGFloat {
+        guard hasPath else { return rowHeight }
+        return url.gitBranch != nil ? badgeRowHeight : entryRowHeight
+    }
+
+    /// Sizes the root list to its content: featured rows + pinned/recent + folders, plus
+    /// headers.
     private var rootListHeight: CGFloat {
         var headers = 0
         if !pinnedEntries.isEmpty { headers += 1 }
         if !recentEntries.isEmpty { headers += 1 }
-        if showsSectionHeaders { headers += 2 }
-        let hasFollowing = !pinnedEntries.isEmpty || !recentEntries.isEmpty || !listedSubfolders.isEmpty
+        let hasFollowing = !pinnedEntries.isEmpty || !recentEntries.isEmpty
+            || !listedSubfolders.isEmpty
         // The featured rows carry a divider (≈15pt) only when other content follows them.
         let featuredRows = showsHero
             ? CGFloat(specialFolders.count) * featuredRowHeight + (hasFollowing ? 15 : 0)
             : 0
-        let entryRows = CGFloat(pinnedEntries.count + recentEntries.count) * entryRowHeight
-        let folderRows = CGFloat(listedSubfolders.count) * rowHeight
-        let computed = featuredRows + entryRows + folderRows + CGFloat(headers) * sectionHeaderHeight + 8
+        let entryRows = (pinnedEntries + recentEntries)
+            .reduce(CGFloat(0)) { $0 + folderRowHeight($1.url, hasPath: true) }
+        let folderRows = listedSubfolders.reduce(CGFloat(0)) { $0 + folderRowHeight($1) }
+        let computed = featuredRows + entryRows + folderRows
+            + CGFloat(headers) * sectionHeaderHeight + 8
         return min(max(computed, rowHeight + 8), listMaxHeight)
     }
 
@@ -1729,6 +2487,9 @@ struct ContentView: View {
                     model.pickRoot()
                     uiState.filterText = ""
                 }
+                Divider()
+                Button("Refresh", action: model.loadSubfolders)
+                    .disabled(model.currentURL == nil)
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "folder.fill")
@@ -1767,16 +2528,18 @@ struct ContentView: View {
             .help("New Project or Clone Repository…")
 
             Menu {
-                Button("Open in Terminal with Claude") {
-                    model.currentURL.map { model.openInTerminal($0) }
-                }
-                Button("Open in Terminal") {
-                    model.currentURL.map { model.openInTerminal($0, runClaude: false) }
+                if let current = model.currentURL {
+                    Button(prefs.effectiveLaunchTarget.actionLabel) { model.launch(current) }
+                    Button("Continue Last Session") { model.launch(current, resume: .latest) }
+                    if prefs.effectiveLaunchTarget != .terminal {
+                        Button("Open in Terminal with Claude") { model.openInTerminal(current) }
+                    }
+                    Button("Open in Terminal") { model.openInTerminal(current, runClaude: false) }
                 }
             } label: {
                 Image(systemName: "terminal")
             } primaryAction: {
-                model.currentURL.map { model.openInTerminal($0) }
+                model.currentURL.map { model.launch($0) }
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -1784,12 +2547,6 @@ struct ContentView: View {
             .disabled(model.currentURL == nil)
             .help("Open Here (click for Claude, ▸ for a plain terminal)")
 
-            Button(action: model.loadSubfolders) {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .disabled(model.currentURL == nil)
-            .help("Refresh")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1910,26 +2667,19 @@ struct ContentView: View {
                             if !pinnedEntries.isEmpty {
                                 sectionHeader("Pinned")
                                 ForEach(Array(pinnedEntries.enumerated()), id: \.element) { i, entry in
-                                    SearchResultRow(entry: entry, isSelected: isSelected(pinnedBase + i), showStatus: true) {}
+                                    FolderRow(url: entry.url, isSelected: isSelected(pinnedBase + i),
+                                              relativePath: parentLabel(entry.url), isRemote: true)
                                 }
                             }
                             if !recentEntries.isEmpty {
                                 sectionHeader("Recent")
                                 ForEach(Array(recentEntries.enumerated()), id: \.element) { i, entry in
-                                    SearchResultRow(entry: entry, isSelected: isSelected(recentBase + i), showStatus: true) {}
+                                    FolderRow(url: entry.url, isSelected: isSelected(recentBase + i),
+                                              relativePath: parentLabel(entry.url), isRemote: true)
                                 }
                             }
-                            if showsSectionHeaders {
-                                sectionHeader("Git Repositories")
-                            }
-                            ForEach(Array(gitFolders.enumerated()), id: \.element) { i, folder in
-                                FolderRow(url: folder, isSelected: isSelected(gitBase + i))
-                            }
-                            if showsSectionHeaders {
-                                sectionHeader("Folders")
-                            }
-                            ForEach(Array(plainFolders.enumerated()), id: \.element) { i, folder in
-                                FolderRow(url: folder, isSelected: isSelected(plainBase + i))
+                            ForEach(Array(displayedFolders.enumerated()), id: \.element) { i, folder in
+                                FolderRow(url: folder, isSelected: isSelected(folderBase + i))
                             }
                         }
                         .padding(.vertical, 4)
@@ -1962,23 +2712,37 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(searchResults.enumerated()), id: \.element) { i, entry in
-                        SearchResultRow(entry: entry, isSelected: isSelected(i)) {
+                        FolderRow(url: entry.url, isSelected: isSelected(i),
+                                  relativePath: entry.relativePath, isRemote: true) {
                             uiState.filterText = ""
                         }
                     }
                 }
                 .padding(.vertical, 4)
             }
-            .frame(height: min(max(CGFloat(searchResults.count) * rowHeight + 8, rowHeight + 8), listMaxHeight))
+            .frame(height: min(max(searchResults.reduce(CGFloat(0)) {
+                $0 + folderRowHeight($1.url, hasPath: true)
+            } + 8, entryRowHeight + 8), listMaxHeight))
         }
     }
 
     private var footer: some View {
-        HStack {
-            Text(footerCountText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
+        HStack(spacing: 6) {
+            if let busy = model.busyMessage {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                Text(busy)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } else {
+                Text(footerCountText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
             Menu {
                 Button("Choose Folders to Show…") {
                     // Return to the root first so setup lists the root's folders (not the
@@ -1990,6 +2754,15 @@ struct ContentView: View {
                     NotificationCenter.default.post(name: .cflOpenSettings, object: nil)
                 }
                 .keyboardShortcut(",", modifiers: .command)
+                Divider()
+                Button("Select Multiple Folders…") { uiState.batchMode = true }
+                .disabled(model.subfolders.isEmpty)
+                Toggle("Sort by Activity", isOn: $prefs.sortByActivity)
+                Menu("Git") {
+                    Button("Fetch All Repos") { model.fetchRepos(visibleRepos, force: true) }
+                    Button("Pull All Clean Repos") { model.pullAll(visibleRepos) }
+                }
+                .disabled(visibleRepos.isEmpty)
                 Divider()
                 Toggle("Launch at Login", isOn: Binding(
                     get: { launchAtLogin.isEnabled },
@@ -2010,6 +2783,11 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .onAppear { launchAtLogin.refresh() }
+    }
+
+    /// Git repos among the folders currently listed — what the fetch/pull-all actions work on.
+    private var visibleRepos: [URL] {
+        model.subfolders.filter { $0.gitBranch != nil }
     }
 
     private var footerCountText: String {
@@ -2197,7 +2975,7 @@ struct SetupView: View {
 
 /// A featured top-level folder shown as a flat, emphasised row at the root. Clicking it browses
 /// in (these are containers, not repos). The subtitle is derived from the folder's contents
-/// (its subfolder count), so it stays accurate for any featured folder regardless of name.
+/// (folder/file counts), so it stays accurate for any featured folder regardless of name.
 struct FeaturedRow: View {
     let url: URL
     let icon: String
@@ -2255,45 +3033,57 @@ struct FeaturedRow: View {
                 return
             }
             let target = url
-            let count = await Task.detached(priority: .utility) {
+            let (folderCount, fileCount) = await Task.detached(priority: .utility) {
                 let contents = (try? FileManager.default.contentsOfDirectory(
                     at: target,
                     includingPropertiesForKeys: [.isDirectoryKey],
                     options: [.skipsHiddenFiles]
                 )) ?? []
-                return contents.filter {
+                let dirs = contents.filter {
                     (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
                 }.count
+                return (dirs, contents.count - dirs)
             }.value
-            subtitle = count == 1 ? "1 folder" : "\(count) folders"
+            subtitle = Self.contentsLabel(folders: folderCount, files: fileCount)
+        }
+    }
+
+    /// Describes whatever the folder actually holds: "3 folders", "5 files",
+    /// "2 folders · 3 files", or "Empty" — so a files-only folder (e.g. Scripts)
+    /// doesn't read "0 folders".
+    private static func contentsLabel(folders: Int, files: Int) -> String {
+        func plural(_ n: Int, _ unit: String) -> String { n == 1 ? "1 \(unit)" : "\(n) \(unit)s" }
+        switch (folders, files) {
+        case (0, 0): return "Empty"
+        case (_, 0): return plural(folders, "folder")
+        case (0, _): return plural(files, "file")
+        default:     return "\(plural(folders, "folder")) · \(plural(files, "file"))"
         }
     }
 }
 
 /// A file row in the Scripts view. Clicking opens a menu; for scripts that's Run / Open in
-/// Terminal / Edit / Reveal, for other files just Open / Reveal.
+/// Terminal / Edit / Reveal, for other files just Open / Reveal. The menu is an NSMenu popped
+/// from a plain Button — SwiftUI's `Menu` flattens custom labels on macOS (template icons,
+/// centred text), which broke the row design.
 struct ScriptRow: View {
     let file: URL
     let isScript: Bool
+    /// Chain mode: clicking toggles the file in/out of the run queue instead of opening
+    /// the menu. `chainIndex` is the 1-based run position when queued.
+    var chainMode: Bool = false
+    var chainIndex: Int? = nil
     let onRun: () -> Void
     let onTerminal: () -> Void
     let onEdit: () -> Void
     let onReveal: () -> Void
+    var onChainToggle: () -> Void = {}
     @State private var hovering = false
 
     private var tileColors: [Color] { Palette.tile }
 
     var body: some View {
-        Menu {
-            if isScript {
-                Button("Run", action: onRun)
-                Button("Open in Terminal", action: onTerminal)
-                Button("Edit", action: onEdit)
-            } else {
-                Button("Open", action: onEdit)
-            }
-            Button("Reveal in Finder", action: onReveal)
-        } label: {
+        Button(action: { chainMode ? onChainToggle() : showMenu() }) {
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(LinearGradient(colors: tileColors, startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -2309,25 +3099,78 @@ struct ScriptRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 6)
-                Image(systemName: isScript ? "play.circle.fill" : "ellipsis.circle")
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(.secondary)
-                    .opacity(hovering ? 1 : 0.55)
+                trailingIcon
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(hovering ? Palette.hover : Color.clear)
+                    .fill(chainIndex != nil ? Color.accentColor.opacity(0.14)
+                          : hovering ? Palette.hover : Color.clear)
             )
             .padding(.horizontal, 6)
             .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .frame(maxWidth: .infinity)
+        .buttonStyle(.plain)
+        .disabled(chainMode && !isScript)
+        .opacity(chainMode && !isScript ? 0.35 : 1)
         .onHover { hovering = $0 }
+    }
+
+    /// Play/ellipsis normally; in chain mode a numbered badge (queued) or empty circle.
+    @ViewBuilder
+    private var trailingIcon: some View {
+        if chainMode {
+            if let n = chainIndex {
+                Text("\(n)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 17, height: 17)
+                    .background(Circle().fill(Color.accentColor))
+            } else {
+                Image(systemName: "circle")
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .opacity(hovering ? 1 : 0.55)
+            }
+        } else {
+            Image(systemName: isScript ? "play.circle.fill" : "ellipsis.circle")
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(.secondary)
+                .opacity(hovering ? 1 : 0.55)
+        }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        func add(_ title: String, _ handler: @escaping () -> Void) {
+            let item = NSMenuItem(title: title, action: #selector(MenuActionTarget.invoke(_:)), keyEquivalent: "")
+            item.target = MenuActionTarget.shared
+            item.representedObject = MenuActionTarget.Box(handler)
+            menu.addItem(item)
+        }
+        if isScript {
+            add("Run", onRun)
+            add("Open in Terminal", onTerminal)
+            add("Edit", onEdit)
+        } else {
+            add("Open", onEdit)
+        }
+        add("Reveal in Finder", onReveal)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+}
+
+/// Routes NSMenuItem clicks back to Swift closures (NSMenuItem needs an ObjC target/action).
+private final class MenuActionTarget: NSObject {
+    static let shared = MenuActionTarget()
+    final class Box: NSObject {
+        let run: () -> Void
+        init(_ run: @escaping () -> Void) { self.run = run }
+    }
+    @objc func invoke(_ sender: NSMenuItem) {
+        (sender.representedObject as? Box)?.run()
     }
 }
 
@@ -2386,124 +3229,6 @@ struct BranchBadge: View {
     }
 }
 
-struct FolderRow: View {
-    @EnvironmentObject var model: FolderModel
-    @EnvironmentObject var favorites: Favorites
-    @State private var hovering = false
-    @State private var status = Git.Status()
-    let url: URL
-    var isSelected: Bool = false
-
-    private var branch: String? { url.gitBranch }
-    private var isGit: Bool { branch != nil }
-    private var isPinned: Bool { favorites.contains(url) }
-    private var highlighted: Bool { hovering || isSelected }
-
-    private var tileColors: [Color] { Palette.tile }
-
-    var body: some View {
-        HStack(spacing: 2) {
-            Button(action: { model.openInTerminal(url) }) {
-                HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(LinearGradient(colors: tileColors, startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 26, height: 26)
-                        .overlay(
-                            Image(systemName: isGit ? "arrow.triangle.branch" : "folder.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.white)
-                        )
-                        .shadow(color: (tileColors.last ?? .black).opacity(0.35), radius: 2, y: 1)
-                    Text(url.lastPathComponent)
-                        .font(.system(size: 13, weight: .medium))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 6)
-                    if let branch = branch {
-                        BranchBadge(branch: branch, status: status)
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Button(action: { model.openInTerminal(url, runClaude: false) }) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(highlighted ? .primary : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(Circle().fill(highlighted ? Color.secondary.opacity(0.15) : .clear))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .opacity(highlighted ? 1 : 0)
-            .help("Open in plain Terminal (no \(model.prefs.launchCommand))")
-
-            PinButton(isPinned: isPinned, visible: highlighted || isPinned) {
-                model.togglePin(url)
-            }
-
-            Button(action: { model.navigateInto(url) }) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(highlighted ? .primary : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        Circle().fill(highlighted ? Color.secondary.opacity(0.15) : .clear)
-                    )
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Browse into \(url.lastPathComponent)")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(highlighted ? (isSelected ? Palette.selection : Palette.hover) : Color.clear)
-        )
-        .padding(.horizontal, 6)
-        .onHover { hovering = $0 }
-        .task(id: url) {
-            guard branch != nil else { return }
-            status = await Task.detached(priority: .utility) {
-                Git.status(at: url)
-            }.value
-        }
-        .contextMenu {
-            Button("Open in Terminal with Claude") {
-                model.openInTerminal(url)
-            }
-            Button("Open in Terminal") {
-                model.openInTerminal(url, runClaude: false)
-            }
-            Button("Browse Into Folder") {
-                model.navigateInto(url)
-            }
-            Divider()
-            Button(isPinned ? "Unpin" : "Pin to Top") {
-                model.togglePin(url)
-            }
-            let editors = Editors.available
-            if !editors.isEmpty {
-                Divider()
-                ForEach(editors, id: \.bundleId) { editor in
-                    Button("Open in \(editor.name)") {
-                        model.openInEditor(url, bundleId: editor.bundleId)
-                    }
-                }
-            }
-            Divider()
-            Button("Open in Finder") {
-                model.openInFinder(url)
-            }
-            Button("Copy Path") {
-                model.copyPath(url)
-            }
-        }
-    }
-}
-
 /// Small star toggle used by folder rows to pin/unpin a folder.
 struct PinButton: View {
     let isPinned: Bool
@@ -2524,115 +3249,6 @@ struct PinButton: View {
     }
 }
 
-/// A row shown in the top-level deep search: like FolderRow, but it displays the
-/// folder's relative path for context and jumps straight to it when browsed into.
-struct SearchResultRow: View {
-    @EnvironmentObject var model: FolderModel
-    @EnvironmentObject var favorites: Favorites
-    @State private var hovering = false
-    @State private var status = Git.Status()
-    let entry: SearchEntry
-    var isSelected: Bool = false
-    /// Whether to compute & show git status. Off for transient deep-search results (which
-    /// churn on every keystroke), on for the stable Pinned / Recent rows.
-    var showStatus: Bool = false
-    /// Called after an action that should dismiss the search (e.g. clearing the filter).
-    let onNavigate: () -> Void
-
-    private var url: URL { entry.url }
-    private var branch: String? { url.gitBranch }
-    private var isGit: Bool { branch != nil }
-    private var isPinned: Bool { favorites.contains(url) }
-    private var highlighted: Bool { hovering || isSelected }
-    private var tileColors: [Color] { Palette.tile }
-
-    var body: some View {
-        HStack(spacing: 2) {
-            Button(action: { model.openInTerminal(url); onNavigate() }) {
-                HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(LinearGradient(colors: tileColors, startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 26, height: 26)
-                        .overlay(
-                            Image(systemName: isGit ? "arrow.triangle.branch" : "folder.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.white)
-                        )
-                        .shadow(color: (tileColors.last ?? .black).opacity(0.35), radius: 2, y: 1)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(url.lastPathComponent)
-                            .font(.system(size: 13, weight: .medium))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        if !entry.relativePath.isEmpty {
-                            Text(entry.relativePath)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.head)
-                        }
-                    }
-                    Spacer(minLength: 6)
-                    if showStatus, let branch = branch {
-                        BranchBadge(branch: branch, status: status)
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Button(action: { model.openInTerminal(url, runClaude: false); onNavigate() }) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(highlighted ? .primary : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(Circle().fill(highlighted ? Color.secondary.opacity(0.15) : .clear))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .opacity(highlighted ? 1 : 0)
-            .help("Open in plain Terminal (no \(model.prefs.launchCommand))")
-
-            PinButton(isPinned: isPinned, visible: highlighted || isPinned) {
-                model.togglePin(url)
-            }
-
-            Button(action: { model.navigateTo(url); onNavigate() }) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(highlighted ? .primary : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(Circle().fill(highlighted ? Color.secondary.opacity(0.15) : .clear))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Browse into \(url.lastPathComponent)")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(highlighted ? (isSelected ? Palette.selection : Palette.hover) : Color.clear)
-        )
-        .padding(.horizontal, 6)
-        .onHover { hovering = $0 }
-        .task(id: url) {
-            guard showStatus, branch != nil else { return }
-            let target = url
-            status = await Task.detached(priority: .utility) { Git.status(at: target) }.value
-        }
-        .contextMenu {
-            Button("Open in Terminal with Claude") { model.openInTerminal(url); onNavigate() }
-            Button("Open in Terminal") { model.openInTerminal(url, runClaude: false); onNavigate() }
-            Button("Browse Into Folder") { model.navigateTo(url); onNavigate() }
-            Divider()
-            Button(isPinned ? "Unpin" : "Pin to Top") { model.togglePin(url) }
-            Divider()
-            Button("Open in Finder") { model.openInFinder(url) }
-            Button("Copy Path") { model.copyPath(url) }
-        }
-    }
-}
 
 // MARK: - Easter egg: a tiny side-scroller
 
@@ -3683,94 +4299,6 @@ private struct MagnetIcon: View {
 
 // MARK: - Settings
 
-struct PreferencesView: View {
-    @EnvironmentObject var prefs: Preferences
-
-    /// Installed terminals, plus the currently-selected one even if it's since been removed,
-    /// so the picker never shows a blank selection.
-    private var terminals: [TerminalOption] {
-        var list = Terminals.installed
-        if !list.contains(where: { $0.bundleId == prefs.terminalBundleId }),
-           let current = Terminals.byId(prefs.terminalBundleId) {
-            list.append(current)
-        }
-        return list
-    }
-
-    private var selectedTerminal: TerminalOption? { Terminals.byId(prefs.terminalBundleId) }
-
-    /// Featured folders edited as a single comma-separated field.
-    private var featuredBinding: Binding<String> {
-        Binding(
-            get: { prefs.featuredFolderNames.joined(separator: ", ") },
-            set: { prefs.featuredFolderNames = $0
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty } }
-        )
-    }
-
-    private var projectFoldersBinding: Binding<String> {
-        Binding(
-            get: { prefs.projectFolders.joined(separator: ", ") },
-            set: { prefs.projectFolders = $0
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty } }
-        )
-    }
-
-    var body: some View {
-        Form {
-            Section("Terminal") {
-                Picker("Open in", selection: $prefs.terminalBundleId) {
-                    ForEach(terminals) { Text($0.name).tag($0.bundleId) }
-                }
-                if selectedTerminal?.runsCommand == false {
-                    Label("Warp opens the folder but can't auto-run the launch command.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Launch command") {
-                TextField("Command", text: $prefs.launchCommand, prompt: Text("claude"))
-                    .textFieldStyle(.roundedBorder)
-                Text("Runs after cd-ing into the folder — e.g. claude, claude --resume, claude --model opus.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Featured folders") {
-                TextField("Names", text: featuredBinding, prompt: Text("PROJECTS, OTHER STUFF"))
-                    .textFieldStyle(.roundedBorder)
-                Text("Comma-separated. Shown as quick shortcuts at the top of the root when they exist.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("New project template") {
-                TextField("Folders", text: projectFoldersBinding,
-                          prompt: Text("Repositories, Data, Scripts, Docs, Reference"))
-                    .textFieldStyle(.roundedBorder)
-                Text("Comma-separated folders created for each new project, plus a seeded CLAUDE.md and README.md.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Global hotkey") {
-                HotKeyField()
-                Text("Opens or closes the launcher from anywhere.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-        .frame(width: 440, height: 500)
-    }
-}
-
 /// Records a global hotkey by capturing the next key-with-modifiers while "recording" is on.
 struct HotKeyField: View {
     @EnvironmentObject var prefs: Preferences
@@ -3877,7 +4405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let prefs = Preferences()
-    private lazy var model = FolderModel(prefs: prefs)
+    private lazy var model = FolderModel(prefs: prefs, active: ActiveSessions())
     private let uiState = UIState()
     private var eventMonitor: Any?
     private var keyMonitor: Any?
@@ -3918,6 +4446,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(model.favorites)
                 .environmentObject(model.history)
                 .environmentObject(prefs)
+                .environmentObject(model.statusStore)
+                .environmentObject(model.insights)
         )
         host.sizingOptions = [.preferredContentSize]
         popover = NSPopover()
@@ -3956,6 +4486,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             Task { @MainActor in self?.showPopover() }
         }
+
+        // One scan on launch tells the launcher which folders already have Claude running, so the
+        // first click can reuse that window instead of opening a second session.
+        model.active.refresh()
     }
 
     /// (Re)registers the global hotkey from the current preferences. Reassigning `hotKey`
@@ -4020,6 +4554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case kVK_Return, kVK_ANSI_KeypadEnter:
             guard uiState.selectionActive, uiState.selection < items.count else { return nil }
             let item = items[uiState.selection]
+            let modifiers = event.modifierFlags
             switch item.kind {
             case .featured:
                 // Containers: Return browses in, same as clicking the row.
@@ -4028,7 +4563,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 uiState.selection = 0
                 uiState.selectionActive = false
             case .folder, .jump:
-                model.openInTerminal(item.url, runClaude: !event.modifierFlags.contains(.command))
+                if modifiers.contains(.command) {
+                    // ⌘Return always means a plain terminal, whatever the launch target is.
+                    model.openInTerminal(item.url, runClaude: false)
+                } else if modifiers.contains(.shift) {
+                    // ⇧Return picks up the folder's most recent Claude session.
+                    model.launch(item.url, resume: .latest)
+                } else {
+                    model.launch(item.url)
+                }
                 popover.performClose(nil)
             }
             return nil
@@ -4055,12 +4598,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             uiState.selectionActive = false
             return nil
         case kVK_Escape:
-            if !uiState.filterText.isEmpty { uiState.filterText = "" }
+            uiState.escapePresses += 1
+            if uiState.batchMode { uiState.endBatch() }
+            else if !uiState.filterText.isEmpty { uiState.filterText = "" }
             else { popover.performClose(nil) }
             return nil
         default:
             return event
         }
+    }
+
+    /// Opening the app again — from Finder, Launchpad, or the Dock — shows the launcher. Without
+    /// this, a menu-bar-only app looks like it did nothing.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showPopover()
+        return true
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
@@ -4076,6 +4628,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         uiState.selection = 0
         uiState.selectionActive = false
+        uiState.endBatch()
+        // Tells the view to re-read sessions, git status and live processes for what's on screen.
+        uiState.openCount += 1
         // Don't reopen straight into the easter egg.
         if uiState.filterText.trimmingCharacters(in: .whitespaces).lowercased() == "xyzzy" {
             uiState.filterText = ""
@@ -4099,3 +4654,5 @@ struct FlaunchApp: App {
         Settings { EmptyView() }
     }
 }
+
+

@@ -24,6 +24,8 @@ APP_NAME="Flaunch"
 BIN_NAME="Flaunch"
 BUNDLE_ID="com.georgegoodwin.flaunch"
 APP_DIR="${APP_NAME}.app"
+# Shown in Settings → Advanced; bump when cutting a release.
+APP_VERSION="1.1.0"
 
 echo "→ Building release binary…"
 swift build -c release
@@ -70,9 +72,9 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${APP_VERSION}</string>
 ${ICON_PLIST_ENTRY}
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
